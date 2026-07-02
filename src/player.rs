@@ -204,6 +204,7 @@ pub fn plan_upgrades(civ: &Civilization) -> [&'static str; 5] {
 #[derive(Debug, Clone)]
 pub struct Civilization {
     pub id: String,
+    pub address: String,        // EVM 地址 (0x + 40 hex)
     pub name: String,
     pub generation: u64,
     pub personality_type: &'static str,
@@ -280,13 +281,13 @@ pub struct Civilization {
 
 impl Civilization {
     pub fn new(
-        id: String, name: String, generation: u64,
+        id: String, address: String, name: String, generation: u64,
         personality: Personality, personality_type: &'static str,
         creation_time: u128, last_collect_time: u128, last_token_time: u128,
         invites: u8,
     ) -> Self {
         Self {
-            id, name, generation, personality_type,
+            id, address, name, generation, personality_type,
             personality, emotion: EmotionalState::new(),
             tilt_level: 0.0, burnout: 0.0,
             rebirth_count: 0, growth_multiplier: 1.0,
@@ -647,4 +648,10 @@ impl Civilization {
 #[derive(Debug)]
 pub enum AttackOutcome {
     Fail, NewbieProtected, SameAlliance, LowEnergy, RateLimited, Success(m::AttackResult),
+}
+
+/// 生成随机 EVM 地址
+pub fn random_evm_address(rng: &mut impl rand::Rng) -> String {
+    let bytes: [u8; 20] = rng.gen();
+    format!("0x{}", hex::encode(bytes))
 }

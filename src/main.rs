@@ -68,10 +68,10 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
     // 顶级
     let top = active.iter().max_by_key(|p| p.total_level());
     let top_s = match top {
-        Some(p) => format!("Lv{} {} Gen{} atks={} kills={} tilt={:.1} burn={:.1} reborn={}x{:.2}",
-            p.total_level() / 5, p.personality_type, p.generation,
-            p.total_attacks, p.total_victims, p.tilt_level, p.burnout,
-            p.rebirth_count, p.growth_multiplier),
+        Some(p) => format!("Lv{} {} {} Gen{} atks={} kills={} reborn={}x{:.2} addr={}",
+            p.total_level() / 5, p.personality_type, p.name, p.generation,
+            p.total_attacks, p.total_victims,
+            p.rebirth_count, p.growth_multiplier, p.address),
         None => "N/A".to_string(),
     };
 

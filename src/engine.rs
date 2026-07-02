@@ -333,11 +333,12 @@ impl GameEngine {
         let invites = if inviter_id.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) };
 
         let pid = format!("g{}p{:06}", self.generation, self.next_player_id);
+        let addr = player::random_evm_address(&mut self.rng);
         let name = format!("{}_{}", stype, self.next_player_id);
         self.next_player_id += 1;
 
         let mut civ = Civilization::new(
-            pid.clone(), name, self.generation, personality, stype,
+            pid.clone(), addr, name, self.generation, personality, stype,
             self.time.saturating_sub(86401), self.time, self.time, invites,
         );
         civ.invited_by = inviter_id.map(|s| s.to_string());
