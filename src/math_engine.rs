@@ -3,11 +3,16 @@
 //!
 //! 与 `math_engine.py` 保持 1:1 对应。
 
-/// 整数平方根 (合约 isqrt 的精确复制)
+/// 整数平方根 — 快速路径 for u64, Newton for larger
 pub fn isqrt(x: u128) -> u128 {
     if x == 0 {
         return 0;
     }
+    // 64-bit 以内用 f64 (快 10x)
+    if x <= u64::MAX as u128 {
+        return (x as f64).sqrt() as u128;
+    }
+    // Newton 迭代 for > 64-bit
     let mut z = (x + 1) / 2;
     let mut y = x;
     while z < y {

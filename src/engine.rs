@@ -309,48 +309,66 @@ impl GameEngine {
         let mut day_ids_attack: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
         day_ids_attack.shuffle(&mut self.rng);
 
-        // 并行: 找目标, 生成攻击订单
+        // 并行: 找目标, 生成攻击订单 (搜一次网格, 候选列表缓存)
         let attack_orders: std::sync::Mutex<Vec<AttackOrder>> = std::sync::Mutex::new(Vec::new());
         day_ids_attack.par_iter().for_each(|pid| {
             let civ = match self.players.get(pid) { Some(c) => c, None => return };
             if civ.is_ruins || civ.is_quit() { return; }
 
-            let mut my_orders = Vec::new();
             let budget = civ.max_attacks_per_day();
             let threshold = civ.attack_shield_threshold();
             let focus = civ.focus_fire();
-            let mut preferred: Option<String> = None;
+            let mut my_orders = Vec::with_capacity(budget.min(10));
+            let mut submitted_targets = std::collections::HashSet::new();
 
-            for _ in 0..budget {
-                // 找目标 (纯读操作, 安全并行)
-                let tid = Self::_find_target_in(civ, &self.players, grid_ref, time, grid_size,
-                    &mut rand::thread_rng(), preferred.as_ref(), threshold);
-                let tid = match tid { Some(id) => id, None => break };
+            // 搜一次网格, 获取排序后的候选列表
+            let candidates = Self::_find_all_targets(civ, &self.players, grid_ref, time, grid_size,
+                &mut rand::thread_rng(), budget * 2);
+
+            for (_, tid) in &candidates {
+                if my_orders.len() >= budget { break; }
+
+                let other = match self.players.get(tid) { Some(o) => o, None => continue };
+                if other.shield_percent() > threshold { continue; }
 
                 let energy_cost = m::calc_attack_energy_cost(civ.weapon_lv);
-                if civ.energy < energy_cost { break; }
+                if civ.energy < energy_cost * (my_orders.len() as u128 + 1) { break; }
 
-                // 预计算联盟加成
-                let bonus = self.players.get(&tid).and_then(|t| {
-                    t.alliance_id.as_ref().and_then(|aid| {
-                        alliances_ref.get(aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
-                    })
+                let bonus = other.alliance_id.as_ref().and_then(|aid| {
+                    alliances_ref.get(aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
                 }).unwrap_or(0);
 
-                my_orders.push(AttackOrder {
-                    attacker_id: pid.clone(),
-                    target_id: tid.clone(),
-                    attacker_weapon_lv: civ.weapon_lv,
-                    attacker_energy: civ.energy,
-                    energy_cost,
-                    has_tokens: civ.attack_tokens > 0,
-                    time,
-                    alliance_bonus: bonus,
-                    attacker_alliance: civ.alliance_id.clone(),
-                });
+                // 计算需要多少次攻击才能杀死该目标 (focus_fire 时多发)
+                let orders_for_this_target = if focus {
+                    let atk = m::calc_attack(civ.weapon_lv);
+                    let def = m::calc_defense(other.shield_lv) + bonus;
+                    let dmg_per_hit = if atk > def { (atk - def) * 2 + (atk + m::SHIELD_DMG_BONUS - def).max(0) } else { 0 };
+                    if dmg_per_hit > 0 {
+                        let total_hp = other.health + other.shield_hp;
+                        ((total_hp + dmg_per_hit - 1) / dmg_per_hit).min(10) as usize // 最多10次
+                    } else { 1 }
+                } else { 1 };
 
-                if focus { preferred = Some(tid); }
+                if submitted_targets.contains(tid) && !focus { continue; }
+
+                for _ in 0..orders_for_this_target {
+                    if my_orders.len() >= budget { break; }
+                    my_orders.push(AttackOrder {
+                        attacker_id: pid.clone(),
+                        target_id: tid.clone(),
+                        attacker_weapon_lv: civ.weapon_lv,
+                        attacker_energy: civ.energy,
+                        energy_cost,
+                        has_tokens: civ.attack_tokens > 0,
+                        time,
+                        alliance_bonus: bonus,
+                        attacker_alliance: civ.alliance_id.clone(),
+                    });
+                }
+
+                submitted_targets.insert(tid.clone());
             }
+
             attack_orders.lock().unwrap().extend(my_orders);
         });
 
@@ -824,7 +842,58 @@ impl GameEngine {
     // 并行攻击辅助函数 (无 &self 依赖, 纯数据驱动)
     // ═══════════════════════════════════════════
 
-    /// 在给定玩家集合中找目标 (并行安全)
+    /// 找所有候选目标 (搜一次网格, 返回排序列表)
+    fn _find_all_targets(
+        civ: &Civilization,
+        players: &HashMap<String, Civilization>,
+        grid: &HashMap<(i64, i64, i64), Vec<String>>,
+        time: u128, grid_size: i64, rng: &mut impl rand::Rng,
+        max_candidates: usize,
+    ) -> Vec<(i64, String)> {
+        let gx = civ.x as i64 / grid_size;
+        let gy = civ.y as i64 / grid_size;
+        let gz = civ.z as i64 / grid_size;
+        let scan = civ.scan_range();
+        let mut candidates: Vec<(i64, String)> = Vec::with_capacity(max_candidates);
+
+        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
+            let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
+            let iter: Box<dyn Iterator<Item = &String>> = if cell.len() > 20 {
+                let sampled: Vec<&String> = cell.choose_multiple(rng, 20).collect();
+                Box::new(sampled.into_iter())
+            } else { Box::new(cell.iter()) };
+
+            for pid in iter {
+                let other = match players.get(pid) { Some(o) => o, None => continue };
+                if other.id == civ.id || other.is_ruins || other.is_quit() { continue; }
+                if other.is_newbie(time) { continue; }
+                if let Some(ref aid) = civ.alliance_id {
+                    if let Some(ref taid) = other.alliance_id { if aid == taid { continue; } }
+                }
+                // 平方距离过滤 (避免 isqrt)
+                let dx = (civ.x - other.x).unsigned_abs();
+                let dy = (civ.y - other.y).unsigned_abs();
+                let dz = (civ.z - other.z).unsigned_abs();
+                let dist_sq = dx * dx + dy * dy + dz * dz;
+                let scan_sq = scan * scan;
+                if dist_sq > scan_sq { continue; }
+
+                // 只有候选者才计算真实距离 (用于评分)
+                let dist = m::isqrt(dist_sq);
+                let mut score = (100i64).saturating_sub(other.shield_percent() as i64) * 10
+                    + (other.energy as i64) / 1000 + (other.dft as i64) / 10000
+                    - (dist as i64) / 10 - (other.weapon_lv as i64) * 5;
+                let es = civ.has_enemy(pid);
+                if es > 0.0 { score += (es * 200.0) as i64; }
+                candidates.push((score, pid.clone()));
+            }
+        }}}
+        candidates.sort_by_key(|(s, _)| -s);
+        if candidates.len() > max_candidates { candidates.truncate(max_candidates); }
+        candidates
+    }
+
+    /// 在给定玩家集合中找目标 (单次, 兼容旧接口)
     fn _find_target_in(
         civ: &Civilization,
         players: &HashMap<String, Civilization>,
