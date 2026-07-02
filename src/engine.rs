@@ -965,7 +965,7 @@ impl GameEngine {
         let mut count = 0;
         for &idx in &ruins {
             if count >= limit { break; }
-            if player::try_rebuild(&mut self.store, idx, self.global_state.is_post_scarcity()) {
+            if player::try_rebuild(&mut self.store, idx, self.global_state.is_post_scarcity(), self.time) {
                 self.total_rebuilds += 1;
                 self._join_alliance(idx);
                 self.grid_dirty = true;

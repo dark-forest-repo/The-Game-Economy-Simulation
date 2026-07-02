@@ -300,7 +300,7 @@ pub fn count_affordable_upgrades(store: &EntityStore, idx: u32, is_post_scarcity
 }
 
 /// 重建
-pub fn try_rebuild(store: &mut EntityStore, idx: u32, is_post_scarcity: bool) -> bool {
+pub fn try_rebuild(store: &mut EntityStore, idx: u32, is_post_scarcity: bool, current_time: u64) -> bool {
     let i = idx as usize;
     if store.is_ruins[i] == 0 { return false; }
     let cost_dft = if is_post_scarcity { 0 } else { 50 * 10u128.pow(18) };
@@ -322,6 +322,7 @@ pub fn try_rebuild(store: &mut EntityStore, idx: u32, is_post_scarcity: bool) ->
     store.shield_hp[i] = m::calc_shield_hp(store.shield_lv[i] as u128) / 4;
     store.collector_durability[i] = (m::calc_max_durability(store.collector_lv[i] as u128) / 4) as u64;
     store.creation_time[i] = store.last_collect_time[i];
+    store.last_collect_time[i] = current_time; // 防止复活后拿死亡积压能量
     store.cold.set_fear(idx, (store.cold.fear(idx) as f64 * 0.5).max(10.0) as u8);
     store.cold.set_consecutive_losses(idx, 0);
     store.cold.set_rebuilds(idx, store.cold.rebuilds(idx) + 1);
