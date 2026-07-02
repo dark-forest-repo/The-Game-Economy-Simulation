@@ -1,4 +1,4 @@
-// Dark Forest 引擎 — 人格驱动 + 邀请系统 + 联盟外交 + 非理性行为
+// Dark Forest 引擎 — SoA 版: self.players → self.store
 #![allow(dead_code)]
 
 use std::collections::{HashMap, BTreeSet};
@@ -7,7 +7,8 @@ use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
 use crate::math_engine as m;
-use crate::player::{self, Civilization, AttackOutcome, Personality, SPAWN_DISTRIBUTION};
+use crate::player::{self, PersonalityPreset, SPAWN_DISTRIBUTION};
+use crate::store::EntityStore;
 use crate::battle_engine::{BattleEngine, AttackOrder};
 
 // ═══════════════════════════════════════════════════════════
@@ -16,18 +17,11 @@ use crate::battle_engine::{BattleEngine, AttackOrder};
 
 #[derive(Debug, Clone)]
 pub struct SimConfig {
-    pub simulation_days: u64,
-    pub seed: u64,
+    pub simulation_days: u64, pub seed: u64,
     pub dft_daily_emission: u128,
-    pub spawn_in_cluster: bool,
-    pub cluster_radius: u128,
-    pub random_spawn_pct: f64,
-    pub initial_players: usize,    // 初始玩家人数
-    pub daily_spawn: usize,        // 每日基础自然流量
-    pub daily_spawn_variance: f64, // 每日波动比例 (0.5 = ±50%)
-    pub invite_enabled: bool,
-    pub diplomacy_enabled: bool,
-    pub rebuild_enabled: bool,
+    pub spawn_in_cluster: bool, pub cluster_radius: u128, pub random_spawn_pct: f64,
+    pub initial_players: usize, pub daily_spawn: usize, pub daily_spawn_variance: f64,
+    pub invite_enabled: bool, pub diplomacy_enabled: bool, pub rebuild_enabled: bool,
 }
 
 impl Default for SimConfig {
@@ -35,57 +29,43 @@ impl Default for SimConfig {
         Self {
             simulation_days: 3650, seed: 42,
             dft_daily_emission: m::DAILY_DFT_EMISSION,
-            spawn_in_cluster: true, cluster_radius: 3000,
-            random_spawn_pct: 0.05,
-            initial_players: 200,
-            daily_spawn: 20,
-            daily_spawn_variance: 0.5,
+            spawn_in_cluster: true, cluster_radius: 3000, random_spawn_pct: 0.05,
+            initial_players: 200, daily_spawn: 20, daily_spawn_variance: 0.5,
             invite_enabled: true, diplomacy_enabled: true, rebuild_enabled: true,
         }
     }
 }
 
 // ═══════════════════════════════════════════════════════════
-// 联盟数据 (含外交)
+// 联盟
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone)]
 pub struct AllianceData {
-    pub id: String,
-    pub leader: String,
-    pub members: Vec<String>,
-    pub created_at: u128,
+    pub id: u32,
+    pub name: String,
+    pub leader: u32,
+    pub members: Vec<u32>,
+    pub created_at: u64,
     pub cohesion: f64,
-    pub alive_member_count: usize,  // 缓存, 每天更新
-    pub war_targets: Vec<String>,
-    pub allies: Vec<String>,
-    pub total_kills: u128,
-    pub total_deaths: u128,
+    pub alive_member_count: usize,
+    pub war_targets: Vec<u32>,
+    pub allies: Vec<u32>,
+    pub total_kills: u32, pub total_deaths: u32,
 }
 
 impl AllianceData {
-    pub fn new(id: String, leader: String, created_at: u128) -> Self {
-        let leader_clone = leader.clone();
+    pub fn new(id: u32, name: String, leader: u32, created_at: u64) -> Self {
         Self {
-            id, leader, members: vec![leader_clone],
+            id, name, leader, members: vec![leader],
             created_at, cohesion: 0.8, alive_member_count: 1,
             war_targets: Vec::new(), allies: Vec::new(),
             total_kills: 0, total_deaths: 0,
         }
     }
 
-    pub fn alive_members(&self, players: &HashMap<String, Civilization>) -> Vec<String> {
-        self.members.iter().filter(|m| {
-            players.get(*m).map_or(false, |p| !p.is_ruins && !p.is_quit())
-        }).cloned().collect()
-    }
-
-    pub fn alive_count(&self, players: &HashMap<String, Civilization>) -> usize {
-        self.alive_members(players).len()
-    }
-
-    pub fn is_at_war(&self, other: &str) -> bool {
-        self.war_targets.contains(&other.to_string())
+    pub fn alive_count(&self, store: &EntityStore) -> usize {
+        self.members.iter().filter(|&&m| store.is_active(m)).count()
     }
 }
 
@@ -95,12 +75,12 @@ impl AllianceData {
 
 #[derive(Debug, Clone)]
 pub struct SimMetrics {
-    pub day: u64, pub total_spawned: usize,
+    pub day: u64, pub total_spawned: u32,
     pub active_players: usize, pub ruins: usize,
     pub total_dft_minted: u128, pub total_dft_burned: u128,
-    pub total_attacks: u128, pub total_deaths: u128,
-    pub total_rebuilds: u128, pub total_invites: u128,
-    pub total_quits: u128, pub active_alliances: usize,
+    pub total_attacks: u32, pub total_deaths: u32,
+    pub total_rebuilds: u32, pub total_invites: u32,
+    pub total_quits: u32, pub active_alliances: usize,
     pub wars_active: usize,
     pub avg_level: f64, pub gini_energy: f64, pub gini_dft: f64,
 }
@@ -112,42 +92,32 @@ pub struct SimMetrics {
 pub struct GameEngine {
     pub cfg: SimConfig,
     pub rng: rand::rngs::StdRng,
-    pub players: HashMap<String, Civilization>,
-    pub time: u128,
+    pub store: EntityStore,
+    pub time: u64,
     pub day: u64,
-    pub generation: u64,
-    initialized: bool,  // 是否已完成初始玩家生成
+    pub generation: u32,
+    pub next_alliance_id: u32,
+    initialized: bool,
 
-    pub alliances: HashMap<String, AllianceData>,
+    pub alliances: HashMap<u32, AllianceData>,
+    pub alliance_sizes: BTreeSet<(usize, u32)>,
+    pub alliance_name_map: HashMap<String, u32>,
     pub alliance_enabled: bool,
 
-    // 空间网格
-    spatial_grid: HashMap<(i64, i64, i64), Vec<String>>,
+    spatial_grid: HashMap<(i64, i64, i64), Vec<u32>>,
     grid_size: i64,
-    grid_dirty: bool,              // 网格需要重建
-    last_grid_rebuild: i64,
-
-    // 活跃玩家缓存 (避免遍历 50K HashMap)
-    active_ids: Vec<String>,
-
-    // 联盟大小索引 (BTreeSet<(alive_count, id)>, O(log N) 最小查找)
-    alliance_sizes: BTreeSet<(usize, String)>,
-
-    // 战斗撮合引擎
-    battle_engine: BattleEngine,
+    grid_dirty: bool,
 
     pub total_dft_minted: u128, pub total_dft_burned: u128,
-    pub total_rebuilds: u128, pub total_invites: u128, pub total_quits: u128,
-    pub total_energy_burned: u128,
+    pub total_rebuilds: u32, pub total_invites: u32, pub total_quits: u32,
 
     pub metrics_history: Vec<SimMetrics>,
     pub global_state: m::GlobalState,
 
-    // 市场
     pub market_rate: u128, pub market_dft_fees: u128,
     pub market_daily_volume: u128, pub market_daily_trades: usize,
 
-    next_player_id: u64,
+    battle_engine: BattleEngine,
 }
 
 impl GameEngine {
@@ -155,43 +125,22 @@ impl GameEngine {
         let seed = config.seed;
         Self {
             cfg: config, rng: rand::rngs::StdRng::seed_from_u64(seed),
-            players: HashMap::new(),
-            time: 0, day: 0, generation: 0, initialized: false,
-            alliances: HashMap::new(), alliance_enabled: true,
-            spatial_grid: HashMap::new(), grid_size: 10000, grid_dirty: true, last_grid_rebuild: -99999,
-            active_ids: Vec::new(),
-            alliance_sizes: BTreeSet::new(),
-            battle_engine: BattleEngine::new(),
+            store: EntityStore::new(),
+            time: 0, day: 0, generation: 0, next_alliance_id: 0, initialized: false,
+            alliances: HashMap::new(), alliance_sizes: BTreeSet::new(),
+            alliance_name_map: HashMap::new(), alliance_enabled: true,
+            spatial_grid: HashMap::new(), grid_size: 10000, grid_dirty: true,
             total_dft_minted: 0, total_dft_burned: 0,
-            total_rebuilds: 0, total_invites: 0, total_quits: 0, total_energy_burned: 0,
+            total_rebuilds: 0, total_invites: 0, total_quits: 0,
             metrics_history: Vec::new(),
             global_state: m::GlobalState::new(),
             market_rate: 100, market_dft_fees: 0,
             market_daily_volume: 0, market_daily_trades: 0,
-            next_player_id: 0,
+            battle_engine: BattleEngine::new(),
         }
     }
 
-    /// 活跃玩家迭代器 (使用 active_ids 缓存, 不遍历 50K HashMap)
-    pub fn active_players(&self) -> impl Iterator<Item = &Civilization> {
-        self.active_ids.iter().filter_map(|id| self.players.get(id))
-    }
-
-    // --- 活跃 ID 维护 ---
-
-    fn _add_active(&mut self, pid: &str) {
-        if !self.active_ids.iter().any(|id| id == pid) {
-            self.active_ids.push(pid.to_string());
-            self.grid_dirty = true;
-        }
-    }
-
-    fn _remove_active(&mut self, pid: &str) {
-        if let Some(pos) = self.active_ids.iter().position(|id| id == pid) {
-            self.active_ids.swap_remove(pos);
-            self.grid_dirty = true;
-        }
-    }
+    pub fn active_count(&self) -> usize { self.store.active_indices().count() }
 
     // ═══════════════════════════════════════════
     // 主循环
@@ -200,907 +149,548 @@ impl GameEngine {
     pub(crate) fn _daily_step(&mut self) {
         self.global_state.update(self.total_dft_minted, self.total_dft_burned);
 
-        // 0. 初始玩家 (仅第一天)
-        if !self.initialized {
-            self._spawn_initial_players();
-            self.initialized = true;
-        }
+        // 0. 初始玩家
+        if !self.initialized { self._spawn_initial(); self.initialized = true; }
 
-        // 1. 基础玩家注入 (每日波动)
-        self._spawn_players();
+        // 1. 每日注入
+        self._spawn_daily();
 
         // 2. 邀请
         if self.cfg.invite_enabled { self._process_invitations(); }
 
-        // 3. DFT 每日释放
+        // 3. DFT 分红
         if self.global_state.can_mint() {
-            let mut day_ids: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
-            let n = day_ids.len();
+            let active: Vec<u32> = self.store.active_indices().collect();
+            let n = active.len();
             if n > 0 {
                 let actual = std::cmp::min(self.cfg.dft_daily_emission, m::TOTAL_SUPPLY.saturating_sub(self.global_state.total_minted));
                 let per = actual / n as u128;
                 if per > 0 {
                     self.total_dft_minted += per * n as u128;
-                    for pid in &day_ids {
-                        if let Some(p) = self.players.get_mut(pid) {
-                            p.dft += per; p.total_dft_earned += per;
-                        }
-                    }
+                    for &idx in &active { self.store.dft[idx as usize] += per; }
                 }
             }
         }
 
-        // 4. 所有玩家行动
-        let mut day_ids: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
-        day_ids.shuffle(&mut self.rng);
-
-        // Phase A: 从 HashMap 提取所有活跃玩家到 Vec (单线程)
-        let mut batch: Vec<(String, Civilization)> = day_ids.iter()
-            .filter_map(|pid| self.players.remove(pid).map(|c| (pid.clone(), c)))
-            .collect();
-
-        // Phase B: 并行处理玩家本地操作 (采集/升级/回盾/弃坑)
-        use rayon::prelude::*;
+        // ═════ Phase B: 采集/升级/情绪 (串行, SoA 数组操作) ═════
         let is_ps = self.global_state.is_post_scarcity();
-        let burned_agg = std::sync::Mutex::new(0u128);
-        let quits_agg = std::sync::Mutex::new(0u128);
-        let adds = std::sync::Mutex::new(Vec::<String>::new());
-        let removes = std::sync::Mutex::new(Vec::<String>::new());
+        let active: Vec<u32> = self.store.active_indices().collect();
+        for &idx in &active {
+            let i = idx as usize;
+            if self.store.is_ruins[i] == 1 { continue; }
 
-        batch.par_iter_mut().for_each(|(pid, civ)| {
-            let was_ruins = civ.is_ruins;
-            let quit = civ.daily_update(self.day);
-
-            if quit && civ.quit_day.is_some() && !civ.is_ruins {
-                civ.is_ruins = true; civ.alliance_id = None;
-                *quits_agg.lock().unwrap() += 1;
-                removes.lock().unwrap().push(pid.clone());
+            // 情绪 & 弃坑
+            let quit = player::update_emotion_daily(&mut self.store, idx, self.day);
+            if quit {
+                self.store.is_ruins[i] = 1;
+                self.total_quits += 1;
+                self.grid_dirty = true;
+                continue;
             }
-            if quit && civ.quit_day.is_none() && was_ruins {
-                adds.lock().unwrap().push(pid.clone());
-            }
-            if civ.is_ruins || civ.is_quit() { return; }
 
-            civ.collect_energy(self.time, false);
-            civ.regen_tokens(self.time);
-            if civ.shield_hp > 0 {
-                let mh = m::calc_shield_hp(civ.shield_lv);
-                if civ.shield_hp < mh {
-                    let r = m::calc_shield_regen(civ.shield_lv) * 12;
-                    let c = r * m::SHIELD_REGEN_RATIO;
-                    if civ.energy >= c { civ.energy -= c; civ.shield_hp = std::cmp::min(civ.shield_hp + r, mh); }
+            // 采集
+            let elapsed = self.time.saturating_sub(self.store.last_collect_time[i]);
+            if elapsed > 0 && self.store.collector_durability[i] > 0 {
+                let rate = player::collect_rate(&self.store, idx);
+                if rate > 0 {
+                    let ct = std::cmp::min(elapsed as u128, self.store.collector_durability[i] as u128);
+                    let gained = ct * rate;
+                    self.store.energy[i] += gained;
+                    self.store.collector_durability[i] -= ct as u64;
                 }
             }
-            let max_up = if civ.burnout > 0.8 { 3 } else if civ.burnout > 0.5 { 8 } else if civ.tilt_level > 0.5 { 30 } else { 20 };
-            let plan = player::plan_upgrades(civ);
+            self.store.last_collect_time[i] = self.time;
+
+            // Token 再生
+            let interval = m::calc_token_regen_interval(self.store.weapon_lv[i] as u128);
+            let interval_s = (interval / 100) as u64;
+            if interval_s > 0 {
+                let elapsed_t = self.time.saturating_sub(self.store.last_token_time[i]);
+                if elapsed_t >= interval_s {
+                    let regened = (elapsed_t / interval_s) as u8;
+                    let max_t = m::calc_max_tokens(self.store.weapon_lv[i] as u128) as u8;
+                    self.store.attack_tokens[i] = std::cmp::min(self.store.attack_tokens[i] as u16 + regened as u16, max_t as u16) as u8;
+                    self.store.last_token_time[i] = self.time;
+                }
+            }
+
+            // 护盾再生
+            if self.store.shield_hp[i] > 0 {
+                let max_hp = m::calc_shield_hp(self.store.shield_lv[i] as u128);
+                if self.store.shield_hp[i] < max_hp {
+                    let regen = m::calc_shield_regen(self.store.shield_lv[i] as u128) * 12;
+                    let cost = regen * m::SHIELD_REGEN_RATIO;
+                    if self.store.energy[i] >= cost {
+                        self.store.energy[i] -= cost;
+                        self.store.shield_hp[i] = std::cmp::min(self.store.shield_hp[i] + regen, max_hp);
+                    }
+                }
+            }
+
+            // 升级
+            let plan = player::plan_upgrades(&self.store, idx);
+            let max_up = if self.store.burnout[i] > 80 { 3 } else if self.store.burnout[i] > 50 { 8 } else if self.store.tilt_level[i] > 50 { 30 } else { 20 };
             for _ in 0..max_up {
                 let mut ok = false;
-                for sys in &plan {
-                    let (s, b) = civ.try_upgrade(sys, self.time, is_ps);
-                    if s { *burned_agg.lock().unwrap() += b; ok = true; break; }
+                for &sys in &plan {
+                    let (s, b) = player::try_upgrade(&mut self.store, idx, sys, is_ps);
+                    if s { self.total_dft_burned += b; ok = true; break; }
                 }
                 if !ok { break; }
             }
-        });
+        }
 
-        self.total_quits += *quits_agg.lock().unwrap();
-        self.total_dft_burned += *burned_agg.lock().unwrap();
-        for p in removes.lock().unwrap().iter() { self._remove_active(p); }
-        for p in adds.lock().unwrap().iter() { self._add_active(p); }
-
-        // Phase C: 并行收集攻击订单 (玩家仍在 batch 中, 读 players 找目标)
-        // 然后放回 HashMap
+        // ═════ Phase C: 收集攻击订单 ═════
         let time = self.time;
         let grid_size = self.grid_size;
-        let grid_ref = &self.spatial_grid;
-        let alliances_ref = &self.alliances;
-        let mut all_orders: Vec<AttackOrder> = Vec::new();
-        let mut destroyed_targets: Vec<String> = Vec::new();
+        let mut attack_orders: Vec<AttackOrder> = Vec::new();
 
-        use rayon::prelude::*;
-        let orders_mutex = std::sync::Mutex::new(&mut all_orders);
+        for &idx in &active {
+            let i = idx as usize;
+            if self.store.is_ruins[i] == 1 { continue; }
 
-        // 先放回 HashMap (为攻击找目标提供数据)
-        for (pid, civ) in batch.drain(..) {
-            self.players.insert(pid, civ);
-        }
+            let budget = player::derive_max_attacks(&self.store, idx);
+            if budget == 0 { continue; }
+            let threshold = player::derive_attack_shield_threshold(&self.store, idx);
+            let focus = player::derive_focus_fire(&self.store, idx);
 
-        // 重新取出: 这次只做攻击
-        let mut day_ids_attack: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
-        day_ids_attack.shuffle(&mut self.rng);
+            // 搜一次网格
+            let candidates = self._find_targets(idx);
+            let mut submitted = std::collections::HashSet::new();
+            let mut player_orders = 0usize;
 
-        // 并行: 找目标, 生成攻击订单 (搜一次网格, 候选列表缓存)
-        let attack_orders: std::sync::Mutex<Vec<AttackOrder>> = std::sync::Mutex::new(Vec::new());
-        day_ids_attack.par_iter().for_each(|pid| {
-            let civ = match self.players.get(pid) { Some(c) => c, None => return };
-            if civ.is_ruins || civ.is_quit() { return; }
+            for &(_, tidx) in &candidates {
+                if player_orders >= budget { break; }
+                let t = tidx as usize;
+                if self.store.shield_percent(tidx) > threshold { continue; }
 
-            let budget = civ.max_attacks_per_day();
-            let threshold = civ.attack_shield_threshold();
-            let focus = civ.focus_fire();
-            let mut my_orders = Vec::with_capacity(budget.min(10));
-            let mut submitted_targets = std::collections::HashSet::new();
+                let energy_cost = m::calc_attack_energy_cost(self.store.weapon_lv[i] as u128);
+                if self.store.energy[i] < energy_cost * (attack_orders.len() as u128 + 1) { break; }
 
-            // 搜一次网格, 获取排序后的候选列表
-            let candidates = Self::_find_all_targets(civ, &self.players, grid_ref, time, grid_size,
-                &mut rand::thread_rng(), budget * 2);
-
-            for (_, tid) in &candidates {
-                if my_orders.len() >= budget { break; }
-
-                let other = match self.players.get(tid) { Some(o) => o, None => continue };
-                if other.shield_percent() > threshold { continue; }
-
-                let energy_cost = m::calc_attack_energy_cost(civ.weapon_lv);
-                if civ.energy < energy_cost * (my_orders.len() as u128 + 1) { break; }
-
-                let bonus = other.alliance_id.as_ref().and_then(|aid| {
-                    alliances_ref.get(aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
+                let bonus = self.store.alliance_idx[t].and_then(|aid| {
+                    self.alliances.get(&aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
                 }).unwrap_or(0);
 
-                // 计算需要多少次攻击才能杀死该目标 (focus_fire 时多发)
-                let orders_for_this_target = if focus {
-                    let atk = m::calc_attack(civ.weapon_lv);
-                    let def = m::calc_defense(other.shield_lv) + bonus;
-                    let dmg_per_hit = if atk > def { (atk - def) * 2 + (atk + m::SHIELD_DMG_BONUS - def).max(0) } else { 0 };
-                    if dmg_per_hit > 0 {
-                        let total_hp = other.health + other.shield_hp;
-                        ((total_hp + dmg_per_hit - 1) / dmg_per_hit).min(10) as usize // 最多10次
-                    } else { 1 }
+                // 杀敌预估
+                let num_orders = if focus {
+                    let atk = m::calc_attack(self.store.weapon_lv[i] as u128);
+                    let def = m::calc_defense(self.store.shield_lv[t] as u128) + bonus;
+                    let dmg = if atk > def { (atk - def) * 2 + (atk + m::SHIELD_DMG_BONUS - def).max(0) } else { 0 };
+                    if dmg > 0 { ((self.store.health[t] + self.store.shield_hp[t] + dmg - 1) / dmg).min(10) as usize } else { 1 }
                 } else { 1 };
 
-                if submitted_targets.contains(tid) && !focus { continue; }
+                if submitted.contains(&tidx) && !focus { continue; }
 
-                for _ in 0..orders_for_this_target {
-                    if my_orders.len() >= budget { break; }
-                    my_orders.push(AttackOrder {
-                        attacker_id: pid.clone(),
-                        target_id: tid.clone(),
-                        attacker_weapon_lv: civ.weapon_lv,
-                        attacker_energy: civ.energy,
-                        energy_cost,
-                        has_tokens: civ.attack_tokens > 0,
-                        time,
-                        alliance_bonus: bonus,
-                        attacker_alliance: civ.alliance_id.clone(),
+                for _ in 0..num_orders {
+                    if player_orders >= budget { break; }
+                    attack_orders.push(AttackOrder {
+                        attacker_idx: idx, target_idx: tidx,
+                        weapon_lv: self.store.weapon_lv[i], energy_cost, has_tokens: self.store.attack_tokens[i] > 0,
+                        time, alliance_bonus: bonus, attacker_alliance: self.store.alliance_idx[i],
                     });
+                    player_orders += 1;
                 }
-
-                submitted_targets.insert(tid.clone());
+                submitted.insert(tidx);
+                if focus { break; }
             }
+        }
 
-            attack_orders.lock().unwrap().extend(my_orders);
-        });
-
-        // Phase D: 战斗引擎撮合所有订单
+        // ═════ Phase D: 战斗引擎 ═════
+        let mut destroyed = Vec::new();
         let mut engine = BattleEngine::new();
-        engine.submit_batch(attack_orders.into_inner().unwrap());
-        let results = engine.execute(&mut self.players);
+        engine.submit_batch(attack_orders);
+        engine.execute(&mut self.store, &mut destroyed);
 
-        // 处理结果
-        for r in &results {
-            if r.success {
-                // 更新攻击者的攻击计数 (通过结果关联)
-                if let Some(attacker) = self.players.get_mut(&r.attacker_id) {
-                    attacker.attack_count_today += 1;
-                }
-                if r.target_destroyed {
-                    destroyed_targets.push(r.target_id.clone());
-                }
-            }
-        }
-        for tid in &destroyed_targets {
-            self._remove_active(tid);
-        }
+        // 网格脏标记
+        if !destroyed.is_empty() { self.grid_dirty = true; }
 
-        // 5. 联盟外交
-        if self.cfg.diplomacy_enabled { self._alliance_diplomacy_tick(); }
+        // 4. 联盟外交
+        if self.cfg.diplomacy_enabled { self._diplomacy_tick(); }
 
-        // 6. 市场
+        // 5. 市场
         self._market_tick();
 
-        // 7. 重建 (非弃坑废墟)
-        if self.cfg.rebuild_enabled {
-            let ruined: Vec<String> = self.players.values()
-                .filter(|p| p.is_ruins && !p.is_quit())
-                .map(|p| p.id.clone()).collect();
-            let limit = std::cmp::min(5, ruined.len());
-            let mut count = 0;
-            for rid in &ruined {
-                if count >= limit { break; }
-                if let Some(civ) = self.players.get_mut(rid) {
-                    if civ.try_rebuild(self.global_state.is_post_scarcity()) {
-                        self.total_rebuilds += 1;
-                        self._add_active(rid);
-                        self._add_to_alliance_by_id(&rid.clone());
-                        count += 1;
-                    }
-                }
-            }
-        }
+        // 6. 重建
+        if self.cfg.rebuild_enabled { self._rebuild_tick(); }
 
-        // 8. 空间网格
-        self._rebuild_grid();
+        // 7. 网格重建
+        if self.grid_dirty { self._rebuild_grid(); }
+    }
+
+    // ═══════════════════════════════════════════
+    // 寻找目标 (网格一次)
+    // ═══════════════════════════════════════════
+
+    fn _find_targets(&mut self, idx: u32) -> Vec<(i64, u32)> {
+        let i = idx as usize;
+        let gx = self.store.x[i] as i64 / self.grid_size;
+        let gy = self.store.y[i] as i64 / self.grid_size;
+        let gz = self.store.z[i] as i64 / self.grid_size;
+        let scan = player::scan_range(&self.store, idx);
+        let scan_sq = scan * scan;
+        let mut candidates = Vec::new();
+
+        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
+            let cell = match self.spatial_grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
+            let iter: Vec<&u32> = if cell.len() > 20 {
+                cell.choose_multiple(&mut self.rng, 20).collect()
+            } else { cell.iter().collect() };
+
+            for &&tidx in &iter {
+                let t = tidx as usize;
+                if tidx == idx || self.store.is_ruins[t] == 1 { continue; }
+                if self.store.is_newbie_until[t] > self.time { continue; }
+                if let Some(aaid) = self.store.alliance_idx[i] {
+                    if let Some(taid) = self.store.alliance_idx[t] { if aaid == taid { continue; } }
+                }
+
+                let dx = (self.store.x[i] - self.store.x[t]).unsigned_abs();
+                let dy = (self.store.y[i] - self.store.y[t]).unsigned_abs();
+                let dz = (self.store.z[i] - self.store.z[t]).unsigned_abs();
+                if dx * dx + dy * dy + dz * dz > scan_sq { continue; }
+
+                let dist = m::isqrt(dx * dx + dy * dy + dz * dz);
+                let sp = self.store.shield_percent(tidx);
+                let mut score = (100i64 - sp as i64) * 10
+                    + (self.store.energy[t] as i64) / 1000 + (self.store.dft[t] as i64) / 10000
+                    - (dist as i64) / 10 - (self.store.weapon_lv[t] as i64) * 5;
+                let es = self.store.has_enemy(idx, tidx);
+                if es > 0 { score += (es as i64) * 2; } // severity * 2
+                candidates.push((score, tidx));
+            }
+        }}}
+
+        candidates.sort_by_key(|(s, _)| -s);
+        if candidates.len() > 100 { candidates.truncate(100); }
+        candidates
     }
 
     // ═══════════════════════════════════════════
     // 玩家生成
     // ═══════════════════════════════════════════
 
-    fn _spawn_initial_players(&mut self) {
-        let count = self.cfg.initial_players;
-        if count == 0 { return; }
-        let types: Vec<&str> = SPAWN_DISTRIBUTION.iter().map(|(n, _)| *n).collect();
-        let weights: Vec<f64> = SPAWN_DISTRIBUTION.iter().map(|(_, w)| *w).collect();
-        for _ in 0..count {
-            let (civ, pid) = self._create_player(&types, &weights, None, None);
-            self.players.insert(pid.clone(), civ);
-            self._add_active(&pid);
-            self._add_to_alliance_by_id(&pid);
+    fn _spawn_initial(&mut self) {
+        for _ in 0..self.cfg.initial_players {
+            self._create_player(None);
         }
-        println!("  🌱 初始 {} 名玩家加入", count);
+        println!("  🌱 初始 {} 名玩家加入", self.cfg.initial_players);
     }
 
-    fn _spawn_players(&mut self) {
+    fn _spawn_daily(&mut self) {
         let base = self.cfg.daily_spawn as f64;
         if base <= 0.0 { return; }
-        let variance = self.cfg.daily_spawn_variance;
-        let count = (base * (1.0 + self.rng.gen_range(-variance..=variance))).round() as usize;
+        let count = (base * (1.0 + self.rng.gen_range(-self.cfg.daily_spawn_variance..=self.cfg.daily_spawn_variance))).round() as usize;
         let count = count.max(1);
         self.generation += 1;
-        let types: Vec<&str> = SPAWN_DISTRIBUTION.iter().map(|(n, _)| *n).collect();
-        let weights: Vec<f64> = SPAWN_DISTRIBUTION.iter().map(|(_, w)| *w).collect();
-        for _ in 0..count {
-            let (civ, pid) = self._create_player(&types, &weights, None, None);
-            self.players.insert(pid.clone(), civ);
-            self._add_active(&pid);
-            self._add_to_alliance_by_id(&pid);
-        }
+        for _ in 0..count { self._create_player(None); }
     }
 
-    fn _create_player(
-        &mut self, types: &[&'static str], weights: &[f64],
-        near_x: Option<i128>, inviter_id: Option<&str>,
-    ) -> (Civilization, String) {
-        let idx = weighted_choice(&mut self.rng, weights);
-        let stype = types[idx];
+    fn _create_player(&mut self, inviter: Option<u32>) -> u32 {
+        let idx = self.store.alloc();
+        let i = idx as usize;
 
-        let personality_base = match stype {
-            "farmer" => Personality::farmer(), "balanced" => Personality::balanced(),
-            "hunter" => Personality::hunter(), "whale" => Personality::whale(),
-            "turtle" => Personality::turtle(), "nomad" => Personality::nomad(),
-            "merchant" => Personality::merchant(), "general" => Personality::general(),
-            "scavenger" => Personality::scavenger(), "berserker" => Personality::berserker(),
-            _ => Personality::balanced(),
-        };
-        let personality = personality_base.jitter(&mut self.rng);
-        let invites = if inviter_id.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) };
+        let types: Vec<&str> = SPAWN_DISTRIBUTION.iter().map(|(n, _)| *n).collect();
+        let weights: Vec<f64> = SPAWN_DISTRIBUTION.iter().map(|(_, w)| *w).collect();
+        let stype = weighted_choice(&mut self.rng, &weights);
+        let preset = player::make_preset(types[stype]);
+        let personality = preset.jitter(&mut self.rng);
 
-        let pid = format!("g{}p{:06}", self.generation, self.next_player_id);
         let addr = player::random_evm_address(&mut self.rng);
-        let name = format!("{}_{}", stype, self.next_player_id);
-        self.next_player_id += 1;
+        let pid = format!("g{}p{:06}", self.generation, self.store.next_id);
+        let name = format!("{}_{}", preset.name, self.store.next_id);
 
-        let mut civ = Civilization::new(
-            pid.clone(), addr, name, self.generation, personality, stype,
-            self.time.saturating_sub(86401), self.time, self.time, invites,
-        );
-        civ.invited_by = inviter_id.map(|s| s.to_string());
+        self.store.ids[i] = pid.clone();
+        self.store.addresses[i] = addr;
+        self.store.names[i] = name;
+        self.store.personality_types[i] = preset.name;
+        self.store.aggression[i] = personality[0];
+        self.store.greed[i] = personality[1];
+        self.store.boldness[i] = personality[2];
+        self.store.sociability[i] = personality[3];
+        self.store.emotionality[i] = personality[4];
+        self.store.invites_remaining[i] = if inviter.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) };
+        self.store.invited_by[i] = inviter;
+        self.store.creation_time[i] = self.time.saturating_sub(86401);
+        self.store.last_collect_time[i] = self.time;
+        self.store.last_token_time[i] = self.time;
+        self.store.generation[i] = self.generation;
+        self.store.is_newbie_until[i] = self.time + m::NEWBIE_PROTECTION as u64;
 
-        if let Some(nx) = near_x {
-            civ.x = nx + self.rng.gen_range(-2000i128..=2000);
-            civ.y = self.rng.gen_range(-2000i128..=2000);
-            civ.z = self.rng.gen_range(-2000i128..=2000);
+        // 坐标
+        if let Some(inv) = inviter {
+            let ix = self.store.x[inv as usize];
+            self.store.x[i] = ix + self.rng.gen_range(-2000i128..=2000);
+            self.store.y[i] = self.rng.gen_range(-2000i128..=2000);
+            self.store.z[i] = self.rng.gen_range(-2000i128..=2000);
         } else if self.cfg.spawn_in_cluster {
             let r: f64 = self.rng.gen_range(0.0..=1.0f64) * self.cfg.cluster_radius as f64;
             let theta: f64 = self.rng.gen_range(0.0..std::f64::consts::TAU);
             let phi: f64 = self.rng.gen_range(0.0..std::f64::consts::PI);
-            civ.x = (r * phi.sin() * theta.cos()) as i128;
-            civ.y = (r * phi.sin() * theta.sin()) as i128;
-            civ.z = (r * phi.cos()) as i128;
+            self.store.x[i] = (r * phi.sin() * theta.cos()) as i128;
+            self.store.y[i] = (r * phi.sin() * theta.sin()) as i128;
+            self.store.z[i] = (r * phi.cos()) as i128;
         } else {
             let range = 1i128 << 40;
-            civ.x = self.rng.gen_range(-range..=range);
-            civ.y = self.rng.gen_range(-range..=range);
-            civ.z = self.rng.gen_range(-range..=range);
+            self.store.x[i] = self.rng.gen_range(-range..=range);
+            self.store.y[i] = self.rng.gen_range(-range..=range);
+            self.store.z[i] = self.rng.gen_range(-range..=range);
         }
-        (civ, pid)
+
+        self.store.id_map.insert(pid, idx);
+        self.grid_dirty = true;
+
+        // 联盟
+        if player::derive_prefer_alliance(&self.store, idx) {
+            self._join_alliance(idx);
+        }
+
+        idx
     }
 
     // ═══════════════════════════════════════════
-    // 邀请系统 (密度依赖, 无硬上限)
+    // 联盟
     // ═══════════════════════════════════════════
 
-    fn _process_invitations(&mut self) {
-        let types: Vec<&str> = SPAWN_DISTRIBUTION.iter().map(|(n, _)| *n).collect();
-        let weights: Vec<f64> = SPAWN_DISTRIBUTION.iter().map(|(_, w)| *w).collect();
-        let active_count = self.active_players().count() as f64;
-
-        // 密度依赖: 人口越多, 邀请概率越低 (logistic 模型)
-        // 承载量 ~50000, 当前人口接近时邀请率下降
-        let carrying_capacity = 50000.0;
-        let density = (active_count / carrying_capacity).min(1.0);
-        let density_factor = (1.0 - density).max(0.05);
-
-        let mut inviters: Vec<(String, i128, bool)> = Vec::new();
-        for (pid, civ) in &self.players {
-            if civ.is_ruins || civ.is_quit() { continue; }
-            if civ.invites_remaining == 0 || civ.is_newbie(self.time) { continue; }
-
-            let is_invited = civ.invited_by.is_some();
-            // 被邀请来的玩家更大概率邀请 (合约奖励机制: referral reward)
-            // 被邀请: 3% + sociability*4% + level/100*3%
-            // 基础: 1.5% + sociability*3% + level/100*2%
-            let base_prob = if is_invited { 0.03 } else { 0.015 };
-            let prob = (base_prob
-                + civ.personality.sociability * if is_invited { 0.04 } else { 0.03 }
-                + (civ.total_level() as f64 / 100.0) * if is_invited { 0.03 } else { 0.02 }) * density_factor;
-
-            if self.rng.gen::<f64>() < prob {
-                inviters.push((pid.clone(), civ.x, is_invited));
-            }
-        }
-
-        for (inviter_id, inviter_x, _) in inviters {
-            let inviter_ok = match self.players.get_mut(&inviter_id) {
-                Some(inv) if inv.invites_remaining > 0 && !inv.is_ruins && !inv.is_quit() => {
-                    inv.invites_remaining -= 1; inv.referral_count += 1; true
-                }
-                _ => false,
-            };
-            if !inviter_ok { continue; }
-
-            if let Some(inviter) = self.players.get_mut(&inviter_id) {
-                inviter.dft += m::REFERRAL_REWARD * 10u128.pow(18);
-                inviter.energy += 1000;
-            }
-
-            let (mut invitee, pid) = self._create_player(&types, &weights, Some(inviter_x), Some(&inviter_id));
-            invitee.dft += 200 * 10u128.pow(18);
-
-            let inviter_aid = self.players.get(&inviter_id).and_then(|c| c.alliance_id.clone());
-            self.players.insert(pid.clone(), invitee);
-            self._add_active(&pid);
-            self.total_invites += 1;
-
-            if let Some(aid) = inviter_aid {
-                if let Some(inv) = self.players.get_mut(&pid) { inv.alliance_id = Some(aid.clone()); }
-                if let Some(alliance) = self.alliances.get_mut(&aid) {
-                    if alliance.members.len() < m::MAX_ALLIANCE_MEMBERS {
-                        alliance.members.push(pid.clone());
-                        // 好友链: 邀请者与被邀请者成为好友
-                        if let Some(inv) = self.players.get_mut(&inviter_id) {
-                            inv.add_friend(pid.clone(), 0.6);
-                        }
-                        if let Some(invitee) = self.players.get_mut(&pid) {
-                            invitee.add_friend(inviter_id.clone(), 0.6);
-                        }
-                        continue;
-                    }
-                }
-            }
-            self._add_to_alliance_by_id(&pid);
-        }
-    }
-
-    // ═══════════════════════════════════════════
-    // 联盟 (BTreeSet 索引优化)
-    // ═══════════════════════════════════════════
-
-    /// 更新联盟大小索引
-    fn _update_alliance_size(&mut self, aid: &str, old_count: usize, new_count: usize) {
-        self.alliance_sizes.remove(&(old_count, aid.to_string()));
-        if new_count > 0 {
-            self.alliance_sizes.insert((new_count, aid.to_string()));
-        }
-    }
-
-    fn _add_to_alliance_by_id(&mut self, civ_id: &str) {
-        let civ = match self.players.get(civ_id) {
-            Some(c) => c, None => return,
-        };
-        if !self.alliance_enabled || !civ.prefer_alliance() || civ.is_quit() { return; }
-
-        // 熟人优先: 加入好友所在联盟
-        let friend_alliance = civ.friends.iter().find_map(|(fid, _)| {
-            self.players.get(fid).and_then(|f| f.alliance_id.clone())
-                .and_then(|aid| {
-                    let a = self.alliances.get(&aid)?;
-                    if a.alive_member_count < m::MAX_ALLIANCE_MEMBERS { Some(aid) } else { None }
-                })
+    fn _join_alliance(&mut self, idx: u32) {
+        // 好友优先
+        let friend_aid = self.store.enemies[idx as usize].iter().find_map(|(fid, _)| {
+            let a = self.store.alliance_idx[*fid as usize]?;
+            let al = self.alliances.get(&a)?;
+            if al.alive_member_count < m::MAX_ALLIANCE_MEMBERS as usize { Some(a) } else { None }
         });
 
-        if let Some(aid) = friend_alliance {
-            if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
-            let new_count = if let Some(a) = self.alliances.get_mut(&aid) {
-                a.members.push(civ_id.to_string());
-                let nc = a.alive_count(&self.players);
-                a.alive_member_count = nc;
-                nc
-            } else { 0 };
-            // 更新索引 (在 mutable borrow 释放后)
-            let old = self.alliance_sizes.iter().find(|(_, id)| id == &aid).map(|(s, _)| *s).unwrap_or(0);
-            self._update_alliance_size(&aid, old, new_count);
+        if let Some(aid) = friend_aid {
+            self.store.alliance_idx[idx as usize] = Some(aid);
+            if let Some(a) = self.alliances.get_mut(&aid) {
+                a.members.push(idx);
+                a.alive_member_count = a.alive_count(&self.store);
+            }
             return;
         }
 
-        // BTreeSet O(log N) 找最小联盟
-        let smallest = self.alliance_sizes.iter().next().cloned();
-        if let Some((count, aid)) = smallest {
-            if count < m::MAX_ALLIANCE_MEMBERS {
-                if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
+        // BTreeSet 找最小
+        if let Some(&(cnt, aid)) = self.alliance_sizes.iter().next() {
+            if cnt < m::MAX_ALLIANCE_MEMBERS as usize {
+                self.store.alliance_idx[idx as usize] = Some(aid);
                 if let Some(a) = self.alliances.get_mut(&aid) {
-                    a.members.push(civ_id.to_string());
-                    let new_count = a.alive_count(&self.players);
-                    a.alive_member_count = new_count;
-                    self._update_alliance_size(&aid, count, new_count);
+                    a.members.push(idx);
+                    let nc = a.alive_count(&self.store);
+                    self.alliance_sizes.remove(&(cnt, aid));
+                    self.alliance_sizes.insert((nc, aid));
+                    a.alive_member_count = nc;
                 }
                 return;
             }
         }
 
-        // 所有联盟都满了, 创建新联盟
-        let aid = format!("A_{:04}", self.alliances.len());
-        if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
-        let mut a = AllianceData::new(aid.clone(), civ_id.to_string(), self.time);
-        a.alive_member_count = 1;
-        self.alliances.insert(aid.clone(), a);
+        // 新联盟
+        let aid = self.next_alliance_id;
+        self.next_alliance_id += 1;
+        let aname = format!("A_{:04}", aid);
+        self.store.alliance_idx[idx as usize] = Some(aid);
+        let mut al = AllianceData::new(aid, aname.clone(), idx, self.time);
+        al.alive_member_count = 1;
+        self.alliances.insert(aid, al);
         self.alliance_sizes.insert((1, aid));
+        self.alliance_name_map.insert(aname, aid);
+    }
+
+    // ═══════════════════════════════════════════
+    // 邀请
+    // ═══════════════════════════════════════════
+
+    fn _process_invitations(&mut self) {
+        let active: Vec<u32> = self.store.active_indices().collect();
+        if active.is_empty() { return; }
+
+        let density = (active.len() as f64 / 50000.0).min(1.0);
+        let density_factor = (1.0 - density).max(0.05);
+
+        let mut inviters = Vec::new();
+        for &idx in &active {
+            let i = idx as usize;
+            if self.store.invites_remaining[i] == 0 { continue; }
+            if self.store.is_newbie_until[i] > self.time { continue; }
+
+            let is_invited = self.store.invited_by[i].is_some();
+            let base = if is_invited { 0.03 } else { 0.015 };
+            let s = self.store.sociability[i] as f64 / 100.0;
+            let lv = self.store.total_level(idx) as f64 / 100.0;
+            let prob = (base + s * if is_invited { 0.04 } else { 0.03 } + lv * if is_invited { 0.03 } else { 0.02 }) * density_factor;
+
+            if self.rng.gen::<f64>() < prob {
+                inviters.push((idx, self.store.x[i]));
+            }
+        }
+
+        for (inviter_idx, inviter_x) in inviters {
+            let ii = inviter_idx as usize;
+            if self.store.invites_remaining[ii] == 0 { continue; }
+            self.store.invites_remaining[ii] -= 1;
+            self.store.referral_count[ii] += 1;
+
+            // 奖励邀请者
+            self.store.dft[ii] += m::REFERRAL_REWARD * 10u128.pow(18);
+            self.store.energy[ii] += 1000;
+
+            let invitee_idx = self._create_player(Some(inviter_idx));
+            let ie = invitee_idx as usize;
+            self.store.dft[ie] += 200 * 10u128.pow(18);
+            self.total_invites += 1;
+
+            // 加入邀请者联盟
+            if let Some(aid) = self.store.alliance_idx[ii] {
+                self.store.alliance_idx[ie] = Some(aid);
+                if let Some(a) = self.alliances.get_mut(&aid) {
+                    a.members.push(invitee_idx);
+                    a.alive_member_count = a.alive_count(&self.store);
+                }
+            }
+        }
     }
 
     // ═══════════════════════════════════════════
     // 联盟外交
     // ═══════════════════════════════════════════
 
-    fn _alliance_diplomacy_tick(&mut self) {
-        let alliance_ids: Vec<String> = self.alliances.keys().cloned().collect();
+    fn _diplomacy_tick(&mut self) {
+        let aids: Vec<u32> = self.alliances.keys().copied().collect();
 
-        // 更新联盟领袖 (最强者)
-        for aid in &alliance_ids {
+        // 更新领袖和活跃数
+        for &aid in &aids {
             let strongest = {
-                let a = match self.alliances.get(aid) { Some(a) => a, None => continue };
-                let alive = a.alive_members(&self.players);
-                alive.iter().max_by_key(|m| {
-                    self.players.get(m.as_str()).map(|p| p.total_level()).unwrap_or(0)
-                }).cloned()
+                let a = match self.alliances.get(&aid) { Some(a) => a, None => continue };
+                let alive = a.members.iter().filter(|&&m| self.store.is_active(m));
+                alive.max_by_key(|&&m| self.store.total_level(m)).copied()
             };
-            if let Some(ref leader) = strongest {
-                if let Some(a) = self.alliances.get_mut(aid) {
-                    if a.leader != *leader {
-                        a.leader = leader.clone();
+            if let Some(leader) = strongest {
+                if let Some(a) = self.alliances.get_mut(&aid) {
+                    if a.leader != leader {
+                        a.leader = leader;
                         a.cohesion = (a.cohesion - 0.05).max(0.3);
                     }
                 }
             }
         }
 
-        // 宣战: 随机攻击邻近联盟
-        for aid in &alliance_ids {
-            let a = match self.alliances.get(aid) { Some(a) => a.clone(), None => continue };
-            if a.alive_count(&self.players) < 2 { continue; }
-            if self.rng.gen::<f64>() > 0.02 { continue; } // 每天 2% 概率宣战
+        // 宣战
+        for &aid in &aids {
+            let a = match self.alliances.get(&aid) { Some(a) => a.clone(), None => continue };
+            if a.alive_member_count < 2 { continue; }
+            if self.rng.gen::<f64>() > 0.02 { continue; }
 
-            // 找个目标联盟
-            let targets: Vec<String> = alliance_ids.iter()
-                .filter(|t| *t != aid && !a.is_at_war(t) && !a.allies.contains(t))
-                .cloned().collect();
-            if targets.is_empty() { continue; }
-
-            let target = targets.choose(&mut self.rng).unwrap().clone();
-            if let Some(a) = self.alliances.get_mut(aid) {
-                a.war_targets.push(target.clone());
-                println!("  ⚔️  WAR: {} declares war on {}!", aid, target);
-            }
-            if let Some(t) = self.alliances.get_mut(&target) {
-                t.war_targets.push(aid.clone());
+            let targets: Vec<u32> = aids.iter()
+                .filter(|&&t| t != aid && !a.war_targets.contains(&t) && !a.allies.contains(&t))
+                .copied().collect();
+            if let Some(&target) = targets.choose(&mut self.rng) {
+                if let Some(a) = self.alliances.get_mut(&aid) { a.war_targets.push(target); }
+                if let Some(t) = self.alliances.get_mut(&target) { t.war_targets.push(aid); }
             }
         }
 
-        // 战争结束 (一方全灭或低概率和谈)
-        let mut to_remove_war: Vec<(String, String)> = Vec::new();
-        for aid in &alliance_ids {
-            let a = match self.alliances.get(aid) { Some(a) => a, None => continue };
-            for enemy in &a.war_targets {
-                let enemy_alive = self.alliances.get(enemy)
-                    .map(|e| e.alive_count(&self.players) > 0)
-                    .unwrap_or(false);
-                if !enemy_alive {
-                    to_remove_war.push((aid.clone(), enemy.clone()));
-                } else if self.rng.gen::<f64>() < 0.005 {
-                    // 和谈 0.5%/天
-                    to_remove_war.push((aid.clone(), enemy.clone()));
-                    println!("  ☮️  PEACE: {} and {} make peace", aid, enemy);
+        // 和谈
+        let mut to_peace = Vec::new();
+        for &aid in &aids {
+            let a = match self.alliances.get(&aid) { Some(a) => a, None => continue };
+            for &enemy in &a.war_targets {
+                if self.alliances.get(&enemy).map(|e| e.alive_member_count == 0).unwrap_or(true) || self.rng.gen::<f64>() < 0.005 {
+                    to_peace.push((aid, enemy));
                 }
             }
         }
-        for (a, e) in to_remove_war {
-            if let Some(alliance) = self.alliances.get_mut(&a) {
-                alliance.war_targets.retain(|w| w != &e);
-            }
+        for (a, e) in to_peace {
+            if let Some(al) = self.alliances.get_mut(&a) { al.war_targets.retain(|&w| w != e); }
+            if let Some(al) = self.alliances.get_mut(&e) { al.war_targets.retain(|&w| w != a); }
         }
 
-        // 合并: 小联盟有概率并入大联盟
-        let mut to_merge: Vec<(String, String)> = Vec::new();
-        for aid in &alliance_ids {
-            let a = match self.alliances.get(aid) { Some(a) => a, None => continue };
-            let alive = a.alive_count(&self.players);
-            if alive > 0 && alive < 3 && self.rng.gen::<f64>() < 0.01 {
-                // 找大联盟合并
-                let big = alliance_ids.iter()
-                    .filter(|t| *t != aid)
-                    .filter_map(|t| self.alliances.get(t))
-                    .max_by_key(|t| t.alive_count(&self.players))
-                    .map(|t| t.id.clone());
-                if let Some(big_id) = big {
-                    let big_alive = self.alliances.get(&big_id)
-                        .map(|b| b.alive_count(&self.players)).unwrap_or(0);
-                    if big_alive + alive <= m::MAX_ALLIANCE_MEMBERS * 2 {
-                        to_merge.push((aid.clone(), big_id));
+        // 合并
+        let mut to_merge = Vec::new();
+        for &aid in &aids {
+            let a = match self.alliances.get(&aid) { Some(a) => a, None => continue };
+            if a.alive_member_count > 0 && a.alive_member_count < 3 && self.rng.gen::<f64>() < 0.01 {
+                if let Some(big) = aids.iter().filter(|&&t| t != aid)
+                    .filter_map(|t| self.alliances.get(&t))
+                    .max_by_key(|t| t.alive_member_count)
+                    .map(|t| t.id)
+                {
+                    let ba = self.alliances.get(&big).map(|b| b.alive_member_count).unwrap_or(0);
+                    if ba + a.alive_member_count <= m::MAX_ALLIANCE_MEMBERS * 2 {
+                        to_merge.push((aid, big));
                     }
                 }
             }
         }
         for (small, big) in to_merge {
-            self._merge_alliances(&small, &big);
+            self._merge_alliances(small, big);
         }
 
-        // 叛逃: 凝聚力低时成员离开
-        let mut deserters: Vec<(String, String)> = Vec::new();
-        for aid in &alliance_ids {
-            let a = match self.alliances.get(aid) { Some(a) => a, None => continue };
-            let cohesion = a.cohesion;
-            for member in &a.members {
-                if member == &a.leader { continue; }
-                if let Some(civ) = self.players.get(member) {
-                    if civ.is_ruins || civ.is_quit() { continue; }
-                    // 低凝聚力 + 低社交性 + 情绪化 → 叛逃
-                    let betray_chance = (1.0 - cohesion) * 0.05
-                        + (1.0 - civ.personality.sociability) * 0.01
-                        + civ.personality.emotionality * 0.01;
-                    if self.rng.gen::<f64>() < betray_chance {
-                        deserters.push((aid.clone(), member.clone()));
-                    }
-                }
+        // 叛逃
+        let mut deserters = Vec::new();
+        for &aid in &aids {
+            let a = match self.alliances.get(&aid) { Some(a) => a, None => continue };
+            let coh = a.cohesion;
+            for &m in &a.members {
+                if m == a.leader { continue; }
+                if !self.store.is_active(m) { continue; }
+                let s = self.store.sociability[m as usize] as f64 / 100.0;
+                let e = self.store.emotionality[m as usize] as f64 / 100.0;
+                let chance = (1.0 - coh) * 0.05 + (1.0 - s) * 0.01 + e * 0.01;
+                if self.rng.gen::<f64>() < chance { deserters.push((aid, m)); }
             }
         }
-        for (aid, member) in deserters {
+        for (aid, m) in deserters {
             if let Some(a) = self.alliances.get_mut(&aid) {
-                a.members.retain(|m| m != &member);
+                a.members.retain(|&x| x != m);
                 a.cohesion = (a.cohesion - 0.1).max(0.0);
             }
-            if let Some(civ) = self.players.get_mut(&member) {
-                civ.alliance_id = None;
-                civ.leave_cooldown_until = self.time + 86400 * 3;
-            }
-            // 叛逃者尝试加入其他联盟
-            self._add_to_alliance_by_id(&member);
+            self.store.alliance_idx[m as usize] = None;
+            self._join_alliance(m);
         }
 
-        // 清理空联盟
-        self.alliances.retain(|_, a| a.alive_count(&self.players) > 0);
-
-        // 重建联盟大小索引
+        // 清理 + 重建索引
+        self.alliances.retain(|_, a| a.alive_member_count > 0);
         self.alliance_sizes.clear();
-        for (aid, a) in &self.alliances {
-            self.alliance_sizes.insert((a.alive_member_count, aid.clone()));
+        for (&aid, a) in &self.alliances {
+            self.alliance_sizes.insert((a.alive_member_count, aid));
         }
 
-        // 更新联盟统计
-        for aid in &alliance_ids {
-            if let Some(a) = self.alliances.get_mut(aid) {
-                a.total_kills = a.members.iter()
-                    .filter_map(|m| self.players.get(m))
-                    .map(|p| p.total_victims).sum();
-                a.total_deaths = a.members.iter()
-                    .filter_map(|m| self.players.get(m))
-                    .map(|p| p.total_deaths).sum();
-                a.alive_member_count = a.alive_count(&self.players);
-                a.cohesion = (a.cohesion + 0.005).min(1.0);
-            }
+        // 更新统计
+        for (&aid, a) in &mut self.alliances {
+            a.total_kills = a.members.iter().filter_map(|&m| {
+                if self.store.is_active(m) { Some(self.store.total_victims[m as usize]) } else { None }
+            }).sum();
+            a.total_deaths = a.members.iter().filter_map(|&m| {
+                if self.store.is_active(m) { Some(self.store.total_deaths[m as usize]) } else { None }
+            }).sum();
+            a.alive_member_count = a.alive_count(&self.store);
+            a.cohesion = (a.cohesion + 0.005).min(1.0);
         }
     }
 
-    fn _merge_alliances(&mut self, small: &str, big: &str) {
-        let small_members: Vec<String> = {
-            let a = match self.alliances.get(small) { Some(a) => a, None => return };
-            // 限制合并人数
-            let big_alive = self.alliances.get(big).map(|b| b.alive_count(&self.players)).unwrap_or(0);
-            if big_alive + a.alive_count(&self.players) > m::MAX_ALLIANCE_MEMBERS * 2 { return; }
+    fn _merge_alliances(&mut self, small: u32, big: u32) {
+        let members: Vec<u32> = {
+            let a = match self.alliances.get(&small) { Some(a) => a, None => return };
+            let ba = self.alliances.get(&big).map(|b| b.alive_member_count).unwrap_or(0);
+            if ba + a.alive_member_count > m::MAX_ALLIANCE_MEMBERS * 2 { return; }
             a.members.clone()
         };
-
-        let war_targets: Vec<String>;
-        let allies_list: Vec<String>;
+        let wars: Vec<u32>;
+        let allies: Vec<u32>;
         {
-            let a = self.alliances.get(small).unwrap();
-            war_targets = a.war_targets.clone();
-            allies_list = a.allies.clone();
+            let a = self.alliances.get(&small).unwrap();
+            wars = a.war_targets.clone(); allies = a.allies.clone();
         }
-
-        for m in &small_members {
-            if let Some(civ) = self.players.get_mut(m) {
-                civ.alliance_id = Some(big.to_string());
-            }
-            if let Some(b) = self.alliances.get_mut(big) {
-                if !b.members.contains(m) { b.members.push(m.clone()); }
+        for &m in &members {
+            self.store.alliance_idx[m as usize] = Some(big);
+            if let Some(b) = self.alliances.get_mut(&big) {
+                if !b.members.contains(&m) { b.members.push(m); }
             }
         }
-
-        // 继承战争和盟友关系
-        if let Some(b) = self.alliances.get_mut(big) {
-            for w in war_targets { if !b.war_targets.contains(&w) { b.war_targets.push(w); } }
-            for ally in allies_list { if !b.allies.contains(&ally) { b.allies.push(ally); } }
+        if let Some(b) = self.alliances.get_mut(&big) {
+            for w in wars { if !b.war_targets.contains(&w) { b.war_targets.push(w); } }
+            for al in allies { if !b.allies.contains(&al) { b.allies.push(al); } }
         }
-
-        println!("  🤝 MERGE: {} merged into {}", small, big);
-        self.alliances.remove(small);
-    }
-
-    // ═══════════════════════════════════════════
-    // 玩家每日行动
-    // ═══════════════════════════════════════════
-    // 并行攻击辅助函数 (无 &self 依赖, 纯数据驱动)
-    // ═══════════════════════════════════════════
-
-    /// 找所有候选目标 (搜一次网格, 返回排序列表)
-    fn _find_all_targets(
-        civ: &Civilization,
-        players: &HashMap<String, Civilization>,
-        grid: &HashMap<(i64, i64, i64), Vec<String>>,
-        time: u128, grid_size: i64, rng: &mut impl rand::Rng,
-        max_candidates: usize,
-    ) -> Vec<(i64, String)> {
-        let gx = civ.x as i64 / grid_size;
-        let gy = civ.y as i64 / grid_size;
-        let gz = civ.z as i64 / grid_size;
-        let scan = civ.scan_range();
-        let mut candidates: Vec<(i64, String)> = Vec::with_capacity(max_candidates);
-
-        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
-            let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
-            let iter: Box<dyn Iterator<Item = &String>> = if cell.len() > 20 {
-                let sampled: Vec<&String> = cell.choose_multiple(rng, 20).collect();
-                Box::new(sampled.into_iter())
-            } else { Box::new(cell.iter()) };
-
-            for pid in iter {
-                let other = match players.get(pid) { Some(o) => o, None => continue };
-                if other.id == civ.id || other.is_ruins || other.is_quit() { continue; }
-                if other.is_newbie(time) { continue; }
-                if let Some(ref aid) = civ.alliance_id {
-                    if let Some(ref taid) = other.alliance_id { if aid == taid { continue; } }
-                }
-                // 平方距离过滤 (避免 isqrt)
-                let dx = (civ.x - other.x).unsigned_abs();
-                let dy = (civ.y - other.y).unsigned_abs();
-                let dz = (civ.z - other.z).unsigned_abs();
-                let dist_sq = dx * dx + dy * dy + dz * dz;
-                let scan_sq = scan * scan;
-                if dist_sq > scan_sq { continue; }
-
-                // 只有候选者才计算真实距离 (用于评分)
-                let dist = m::isqrt(dist_sq);
-                let mut score = (100i64).saturating_sub(other.shield_percent() as i64) * 10
-                    + (other.energy as i64) / 1000 + (other.dft as i64) / 10000
-                    - (dist as i64) / 10 - (other.weapon_lv as i64) * 5;
-                let es = civ.has_enemy(pid);
-                if es > 0.0 { score += (es * 200.0) as i64; }
-                candidates.push((score, pid.clone()));
-            }
-        }}}
-        candidates.sort_by_key(|(s, _)| -s);
-        if candidates.len() > max_candidates { candidates.truncate(max_candidates); }
-        candidates
-    }
-
-    /// 在给定玩家集合中找目标 (单次, 兼容旧接口)
-    fn _find_target_in(
-        civ: &Civilization,
-        players: &HashMap<String, Civilization>,
-        grid: &HashMap<(i64, i64, i64), Vec<String>>,
-        time: u128, grid_size: i64, rng: &mut impl rand::Rng,
-        preferred: Option<&String>, threshold: u128,
-    ) -> Option<String> {
-        let gx = civ.x as i64 / grid_size;
-        let gy = civ.y as i64 / grid_size;
-        let gz = civ.z as i64 / grid_size;
-        let scan = civ.scan_range();
-        let mut candidates: Vec<(i64, String)> = Vec::new();
-
-        // 战争目标
-        let war_targets: Vec<String> = civ.alliance_id.as_ref()
-            .and_then(|aid| players.get(aid)) // 这里不太对，我们需要联盟的 war_targets
-            .map(|_| Vec::new())
-            .unwrap_or_default();
-        // 简化为: 不传 war_targets (影响不大)
-
-        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
-            let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
-            let iter: Box<dyn Iterator<Item = &String>> = if cell.len() > 20 {
-                let sampled: Vec<&String> = cell.choose_multiple(rng, 20).collect();
-                Box::new(sampled.into_iter())
-            } else { Box::new(cell.iter()) };
-
-            for pid in iter {
-                let other = match players.get(pid) { Some(o) => o, None => continue };
-                if other.id == civ.id || other.is_ruins || other.is_quit() { continue; }
-                if other.is_newbie(time) { continue; }
-                if let Some(ref aid) = civ.alliance_id {
-                    if let Some(ref taid) = other.alliance_id { if aid == taid { continue; } }
-                }
-                if other.shield_percent() > threshold { continue; }
-                let dist = m::distance(civ.x, civ.y, civ.z, other.x, other.y, other.z);
-                if dist > scan { continue; }
-
-                let mut score = 100i64.saturating_sub(other.shield_percent() as i64) * 10
-                    + (other.energy as i64) / 1000 + (other.dft as i64) / 10000
-                    - (dist as i64) / 10 - (other.weapon_lv as i64) * 5;
-                let es = civ.has_enemy(pid);
-                if es > 0.0 { score += (es * 200.0) as i64; }
-                if let Some(pref) = preferred { if *pid == *pref { score += 500; } }
-                candidates.push((score, pid.clone()));
-            }
-        }}}
-        if candidates.is_empty() { return None; }
-        candidates.sort_by_key(|(s, _)| -s);
-        Some(candidates[0].1.clone())
-    }
-
-    /// 联盟防御加成 (并行安全版)
-    fn _alliance_bonus_from(
-        target: &Civilization,
-        alliances: &HashMap<String, AllianceData>,
-        players: &HashMap<String, Civilization>,
-    ) -> u128 {
-        let aid = match target.alliance_id { Some(ref a) => a, None => return 0 };
-        let a = match alliances.get(aid) { Some(a) => a, None => return 0 };
-        a.alive_count(players).saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS
-    }
-
-    // 攻击阶段 (串行, 需要 HashMap 找目标)
-    fn _player_attack_tick(&mut self, civ: &mut Civilization) {
-        civ.update_reputation();
-
-        civ.attack_count_today = 0;
-        let attack_budget = civ.max_attacks_per_day();
-        let threshold = civ.attack_shield_threshold();
-        let focus = civ.focus_fire();
-        let mut preferred: Option<String> = None;
-
-        for _ in 0..attack_budget {
-            let tid = self._find_target(civ, preferred.as_ref(), threshold);
-            let tid = match tid { Some(id) => id, None => break };
-            let mut target = match self.players.remove(&tid) { Some(t) => t, None => continue };
-            let bonus = self._alliance_defense_bonus(&target);
-
-            // 战争加成: 如果与目标联盟处于战争状态, 攻击加成 +50%
-            let at_war = civ.alliance_id.as_ref().and_then(|aid| {
-                self.alliances.get(aid).map(|a| a.is_at_war(&target.alliance_id.clone().unwrap_or_default()))
-            }).unwrap_or(false);
-            // 我们在 math_engine 中没有战争加成, 这里额外补偿一下
-            // 直接给攻击者加能量(实际是降低能量消耗)
-            if at_war {
-                if civ.energy > 200 { civ.energy -= 100; } // 战争狂热: 自损100能量也要打
-            }
-
-            let result = civ.attack_target(&mut target, self.time, bonus);
-            let target_destroyed = target.is_ruins;
-            let success = matches!(result, AttackOutcome::Success(_));
-            if success {
-                civ.attack_count_today += 1;
-                if focus { preferred = Some(tid.clone()); }
-                // 战争击杀记录
-                if let Some(ref aid) = civ.alliance_id {
-                    if let Some(a) = self.alliances.get_mut(aid) {
-                        a.total_kills += 1;
-                    }
-                }
-                if let Some(ref taid) = target.alliance_id {
-                    if let Some(a) = self.alliances.get_mut(taid) {
-                        a.total_deaths += 1;
-                    }
-                }
-            }
-            self.players.insert(tid.clone(), target);
-            if target_destroyed {
-                self._remove_active(&tid);
-            }
-            if !success && !focus { break; }
-        }
-    }
-
-    // ═══════════════════════════════════════════
-    // 目标寻找 (考虑战争+仇人链)
-    // ═══════════════════════════════════════════
-
-    fn _find_target(
-        &mut self, civ: &Civilization, preferred: Option<&String>, threshold: u128,
-    ) -> Option<String> {
-        self._rebuild_grid();
-        let gx = civ.x as i64 / self.grid_size;
-        let gy = civ.y as i64 / self.grid_size;
-        let gz = civ.z as i64 / self.grid_size;
-        let scan = civ.scan_range();
-        let mut candidates: Vec<(i64, String)> = Vec::new();
-
-        // 战争目标优先
-        let war_targets: Vec<String> = civ.alliance_id.as_ref()
-            .and_then(|aid| self.alliances.get(aid))
-            .map(|a| a.war_targets.clone())
-            .unwrap_or_default();
-
-        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
-            let cell = match self.spatial_grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
-            let iter: Box<dyn Iterator<Item = &String>> = if cell.len() > 20 {
-                Box::new(cell.choose_multiple(&mut self.rng, 20).into_iter())
-            } else { Box::new(cell.iter()) };
-
-            for pid in iter {
-                let other = match self.players.get(pid) { Some(o) => o, None => continue };
-                if other.id == civ.id || other.is_ruins || other.is_quit() { continue; }
-                if other.is_newbie(self.time) { continue; }
-                if let Some(ref aid) = civ.alliance_id {
-                    if let Some(ref taid) = other.alliance_id {
-                        if aid == taid { continue; }
-                    }
-                }
-                if other.shield_percent() > threshold { continue; }
-                let dist = m::distance(civ.x, civ.y, civ.z, other.x, other.y, other.z);
-                if dist > scan { continue; }
-
-                let shield_s = 100i64.saturating_sub(other.shield_percent() as i64) * 10;
-                let energy_s = (other.energy as i64) / 1000;
-                let dft_s = (other.dft as i64) / 10000;
-                let dist_p = -(dist as i64) / 10;
-                let wep_p = -(other.weapon_lv as i64) * 5;
-                let mut score = shield_s + energy_s + dft_s + dist_p + wep_p;
-
-                // 仇人分
-                let enemy_s = civ.has_enemy(pid);
-                if enemy_s > 0.0 { score += (enemy_s * 200.0) as i64; }
-
-                // 战争分
-                if let Some(ref taid) = other.alliance_id {
-                    if war_targets.contains(taid) { score += 300; }
-                }
-
-                // 集火
-                if let Some(pref) = preferred { if *pid == *pref { score += 500; } }
-
-                candidates.push((score, pid.clone()));
-            }
-        }}}
-
-        if candidates.is_empty() { return None; }
-        candidates.sort_by_key(|(s, _)| -s);
-        Some(candidates[0].1.clone())
-    }
-
-    // ═══════════════════════════════════════════
-    // 空间网格
-    // ═══════════════════════════════════════════
-
-    fn _rebuild_grid(&mut self) {
-        if !self.grid_dirty { return; }
-        self.grid_dirty = false;
-        self.spatial_grid.clear();
-        for pid in &self.active_ids {
-            let civ = match self.players.get(pid) { Some(c) => c, None => continue };
-            let gx = civ.x as i64 / self.grid_size;
-            let gy = civ.y as i64 / self.grid_size;
-            let gz = civ.z as i64 / self.grid_size;
-            self.spatial_grid.entry((gx, gy, gz)).or_insert_with(Vec::new).push(pid.clone());
-        }
-    }
-
-    // ═══════════════════════════════════════════
-    // 联盟防御加成
-    // ═══════════════════════════════════════════
-
-    fn _alliance_defense_bonus(&self, target: &Civilization) -> u128 {
-        let aid = match target.alliance_id { Some(ref a) => a, None => return 0 };
-        let a = match self.alliances.get(aid) { Some(a) => a, None => return 0 };
-        a.alive_count(&self.players).saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS
+        self.alliances.remove(&small);
     }
 
     // ═══════════════════════════════════════════
@@ -1108,25 +698,25 @@ impl GameEngine {
     // ═══════════════════════════════════════════
 
     fn _market_tick(&mut self) {
-        let mut sell: Vec<(String, u128)> = Vec::new();
-        let mut buy: Vec<(String, u128)> = Vec::new();
-        for (pid, civ) in &self.players {
-            if civ.is_ruins || civ.is_quit() { continue; }
-            let sp = civ.sell_energy_pct();
-            let ma = civ.max_attacks_per_day();
-            if sp > 0.0 && civ.energy > 5000 {
-                let ts = ((civ.energy - 5000) as f64 * sp) as u128;
-                if ts > 100 { sell.push((pid.clone(), ts)); }
+        let mut sell: Vec<(u32, u128)> = Vec::new();
+        let mut buy: Vec<(u32, u128)> = Vec::new();
+        for idx in self.store.active_indices() {
+            let i = idx as usize;
+            let sp = player::derive_sell_energy_pct(&self.store, idx);
+            let ma = player::derive_max_attacks(&self.store, idx);
+            if sp > 0.0 && self.store.energy[i] > 5000 {
+                let ts = ((self.store.energy[i] - 5000) as f64 * sp) as u128;
+                if ts > 100 { sell.push((idx, ts)); }
             } else if ma > 12 {
-                let en = (ma as u128) * m::calc_attack_energy_cost(civ.weapon_lv);
-                let ed = en.saturating_sub(civ.energy);
-                if ed > 100 && civ.dft > 1000 { buy.push((pid.clone(), ed)); }
+                let en = (ma as u128) * m::calc_attack_energy_cost(self.store.weapon_lv[i] as u128);
+                let ed = en.saturating_sub(self.store.energy[i]);
+                if ed > 100 && self.store.dft[i] > 1000 { buy.push((idx, ed)); }
             }
         }
         sell.shuffle(&mut self.rng); buy.shuffle(&mut self.rng);
         let mut tv: u128 = 0; let mut eb: u128 = 0;
         self.market_daily_trades = 0;
-        let mut sc: HashMap<String, u128> = HashMap::new();
+        let mut sc: HashMap<u32, u128> = HashMap::new();
         for (bid, need) in buy.iter().take(10) {
             let mut rem = *need;
             for (sid, amt) in &sell {
@@ -1135,16 +725,16 @@ impl GameEngine {
                 let trade = std::cmp::min(rem, std::cmp::min(avail, 5000));
                 if trade < 100 { continue; }
                 let dft_cost = trade * self.market_rate / 100;
-                if self.players.get(bid).map_or(0, |c| c.dft) < dft_cost { continue; }
-                if self.players.get(sid).map_or(0, |c| c.energy) < trade { continue; }
-                if let Some(b) = self.players.get_mut(bid) { b.dft = b.dft.saturating_sub(dft_cost); }
-                if let Some(s) = self.players.get_mut(sid) { s.dft += dft_cost; }
+                if self.store.dft[*bid as usize] < dft_cost { continue; }
+                if self.store.energy[*sid as usize] < trade { continue; }
+                self.store.dft[*bid as usize] = self.store.dft[*bid as usize].saturating_sub(dft_cost);
+                self.store.dft[*sid as usize] += dft_cost;
                 let burn = trade * 500 / 10000;
-                if let Some(s) = self.players.get_mut(sid) { s.energy = s.energy.saturating_sub(trade); }
-                if let Some(b) = self.players.get_mut(bid) { b.energy += trade.saturating_sub(burn); }
+                self.store.energy[*sid as usize] = self.store.energy[*sid as usize].saturating_sub(trade);
+                self.store.energy[*bid as usize] += trade.saturating_sub(burn);
                 eb += burn; self.market_dft_fees += dft_cost * 100 / 10000;
                 tv += trade; self.market_daily_trades += 1;
-                *sc.entry(sid.clone()).or_insert(0) += trade;
+                *sc.entry(*sid).or_insert(0) += trade;
                 rem = rem.saturating_sub(trade);
                 if rem < 100 { break; }
             }
@@ -1155,50 +745,83 @@ impl GameEngine {
             self.market_rate = ((self.market_rate as f64 * (1.0 + (dp - 0.5) * 0.1)) as u128).clamp(10, 10000);
         }
         self.market_daily_volume = tv;
-        self.total_energy_burned += eb;
     }
 
     // ═══════════════════════════════════════════
-    // 指标收集
+    // 网格
+    // ═══════════════════════════════════════════
+
+    fn _rebuild_grid(&mut self) {
+        if !self.grid_dirty { return; }
+        self.grid_dirty = false;
+        self.spatial_grid.clear();
+        for idx in self.store.active_indices() {
+            let i = idx as usize;
+            let gx = self.store.x[i] as i64 / self.grid_size;
+            let gy = self.store.y[i] as i64 / self.grid_size;
+            let gz = self.store.z[i] as i64 / self.grid_size;
+            self.spatial_grid.entry((gx, gy, gz)).or_insert_with(Vec::new).push(idx);
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // 重建
+    // ═══════════════════════════════════════════
+
+    fn _rebuild_tick(&mut self) {
+        let ruins: Vec<u32> = (0..self.store.ids.len() as u32)
+            .filter(|&idx| self.store.is_ruins[idx as usize] == 1 && self.store.total_deaths[idx as usize] > 0)
+            .collect();
+        let limit = std::cmp::min(5, ruins.len());
+        let mut count = 0;
+        for &idx in &ruins {
+            if count >= limit { break; }
+            if player::try_rebuild(&mut self.store, idx, self.global_state.is_post_scarcity()) {
+                self.total_rebuilds += 1;
+                self._join_alliance(idx);
+                self.grid_dirty = true;
+                count += 1;
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════
+    // 指标
     // ═══════════════════════════════════════════
 
     pub fn _collect_metrics(&self) -> SimMetrics {
-        let total = self.players.len();
-        let active: Vec<&Civilization> = self.active_players().collect();
-        let ac = active.len();
-        let ruins = total.saturating_sub(ac);
+        let active: Vec<u32> = self.store.active_indices().collect();
+        let total = self.store.ids.len();
 
         if active.is_empty() {
             return SimMetrics {
-                day: self.day, total_spawned: total, active_players: 0, ruins,
+                day: self.day, total_spawned: total as u32, active_players: 0, ruins: total,
                 total_dft_minted: self.total_dft_minted, total_dft_burned: self.total_dft_burned,
-                total_attacks: self.players.values().map(|p| p.total_attacks).sum(),
-                total_deaths: self.players.values().map(|p| p.total_deaths).sum(),
+                total_attacks: self.store.total_attacks.iter().sum(),
+                total_deaths: self.store.total_deaths.iter().sum(),
                 total_rebuilds: self.total_rebuilds, total_invites: self.total_invites,
                 total_quits: self.total_quits, active_alliances: 0, wars_active: 0,
                 avg_level: 0.0, gini_energy: 0.0, gini_dft: 0.0,
             };
         }
 
-        let avg_lv = active.iter().map(|p| p.total_level() as f64).sum::<f64>() / ac as f64 / 5.0;
+        let avg_lv = active.iter().map(|&idx| self.store.total_level(idx) as f64).sum::<f64>() / active.len() as f64 / 5.0;
 
-        let mut en: Vec<u128> = active.iter().map(|p| p.energy).collect(); en.sort();
+        let mut en: Vec<u128> = active.iter().map(|&idx| self.store.energy[idx as usize]).collect(); en.sort();
         let ge = gini(&en);
-        let mut dfts: Vec<u128> = active.iter().map(|p| p.dft).collect(); dfts.sort();
+        let mut dfts: Vec<u128> = active.iter().map(|&idx| self.store.dft[idx as usize]).collect(); dfts.sort();
         let gd = gini(&dfts);
 
-        let active_alliances = self.alliances.values()
-            .filter(|a| a.alive_count(&self.players) >= 2).count();
-        let wars_active = self.alliances.values()
-            .filter(|a| !a.war_targets.is_empty()).count();
+        let aac = self.alliances.values().filter(|a| a.alive_member_count >= 2).count();
+        let wars = self.alliances.values().filter(|a| !a.war_targets.is_empty()).count();
 
         SimMetrics {
-            day: self.day, total_spawned: total, active_players: ac, ruins,
+            day: self.day, total_spawned: total as u32, active_players: active.len(), ruins: total - active.len(),
             total_dft_minted: self.total_dft_minted, total_dft_burned: self.total_dft_burned,
-            total_attacks: self.players.values().map(|p| p.total_attacks).sum(),
-            total_deaths: self.players.values().map(|p| p.total_deaths).sum(),
+            total_attacks: self.store.total_attacks.iter().sum(),
+            total_deaths: self.store.total_deaths.iter().sum(),
             total_rebuilds: self.total_rebuilds, total_invites: self.total_invites,
-            total_quits: self.total_quits, active_alliances, wars_active,
+            total_quits: self.total_quits, active_alliances: aac, wars_active: wars,
             avg_level: avg_lv, gini_energy: ge, gini_dft: gd,
         }
     }
@@ -1211,9 +834,7 @@ impl GameEngine {
 fn weighted_choice(rng: &mut impl Rng, weights: &[f64]) -> usize {
     let total: f64 = weights.iter().sum();
     let mut r: f64 = rng.gen_range(0.0..total);
-    for (i, w) in weights.iter().enumerate() {
-        r -= w; if r <= 0.0 { return i; }
-    }
+    for (i, w) in weights.iter().enumerate() { r -= w; if r <= 0.0 { return i; } }
     weights.len() - 1
 }
 
@@ -1224,8 +845,6 @@ fn gini(values: &[u128]) -> f64 {
     if total == 0 { return 0.0; }
     let tf = total as f64; let nf = n as f64;
     let mut cum: u128 = 0; let mut gs: f64 = 0.0;
-    for (i, v) in values.iter().enumerate() {
-        cum += v; gs += (i + 1) as f64 * tf / nf - cum as f64;
-    }
+    for (i, v) in values.iter().enumerate() { cum += v; gs += (i + 1) as f64 * tf / nf - cum as f64; }
     (gs / (nf * tf / 2.0)).clamp(0.0, 1.0)
 }
