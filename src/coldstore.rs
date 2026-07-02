@@ -38,6 +38,7 @@ const O_GEN: usize = 99;          // 4
 const O_INVITES: usize = 103;     // 1
 const O_INVITED: usize = 104;     // 5 (4 bytes u32 + 1 flag)
 const O_REFERRAL: usize = 109;    // 2
+const O_IS_ELITE: usize = 111;    // 1
 // pad to 128
 
 pub struct ColdStore {
@@ -132,6 +133,10 @@ impl ColdStore {
     pub fn set_consecutive_losses(&mut self, idx: u32, val: u16) { self._write_u16(idx, O_CLOSSES, val); }
     pub fn referral_count(&self, idx: u32) -> u16 { self._read_u16(idx, O_REFERRAL) }
     pub fn set_referral_count(&mut self, idx: u32, val: u16) { self._write_u16(idx, O_REFERRAL, val); }
+
+    // is_elite
+    pub fn is_elite(&self, idx: u32) -> bool { self.slot(idx)[O_IS_ELITE] != 0 }
+    pub fn set_is_elite(&mut self, idx: u32, val: bool) { self.slot_mut(idx)[O_IS_ELITE] = if val { 1 } else { 0 }; }
 
     // f32
     pub fn growth_multiplier(&self, idx: u32) -> f32 {

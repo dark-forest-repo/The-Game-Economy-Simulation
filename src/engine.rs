@@ -188,7 +188,6 @@ impl GameEngine {
             active_b.par_iter().for_each(|&idx| {
                 let store = unsafe { &mut *(store_ptr as *mut EntityStore) };
                 let i = idx as usize;
-                let store = unsafe { &mut *(store_ptr as *mut EntityStore) };
 
                 if store.is_ruins[i] == 1 { return; }
                 let quit = player::update_emotion_daily(store, idx, time);
@@ -237,18 +236,23 @@ impl GameEngine {
                     }
                 }
 
-                // 升级 (动态规划)
-                let plan = player::plan_upgrades(store, idx);
-                let max_up = if store.cold.burnout(idx) > 80 { 3 }
-                    else if store.cold.burnout(idx) > 50 { 8 }
-                    else if store.cold.tilt_level(idx) > 50 { 30 } else { 20 };
-                for _ in 0..max_up {
-                    let mut ok = false;
-                    for &sys in &plan {
-                        let (s, b) = player::try_upgrade(store, idx, sys, is_ps);
-                        if s { *burned_agg.lock().unwrap() += b; ok = true; break; }
+                // 升级 (跳过无资源玩家)
+                let has_resources = store.energy[i] > 500 || store.dft[i] > 0;
+                if has_resources {
+                    let plan = player::plan_upgrades(store, idx);
+                    let max_up = if store.cold.burnout(idx) > 80 { 3 }
+                        else if store.cold.burnout(idx) > 50 { 8 }
+                        else if store.cold.tilt_level(idx) > 50 { 30 } else { 20 };
+                    // 先算能升几级, 不盲目试
+                    let affordable = player::count_affordable_upgrades(store, idx, is_ps, &plan).min(max_up);
+                    for _ in 0..affordable {
+                        let mut ok = false;
+                        for &sys in &plan {
+                            let (s, b) = player::try_upgrade(store, idx, sys, is_ps);
+                            if s { *burned_agg.lock().unwrap() += b; ok = true; break; }
+                        }
+                        if !ok { break; }
                     }
-                    if !ok { break; }
                 }
             });
 
@@ -256,7 +260,35 @@ impl GameEngine {
             self.total_quits += *quits_agg.lock().unwrap();
         }
 
-        // ═════ Phase C: 并行收集攻击订单 (Rayon) ═════
+        // ═════ Hybrid: 精英/群众分类 ═════
+        {
+            // 战斗型人格→精英, 采集型→群众
+            let attacker_types = ["hunter", "whale", "general", "berserker", "scavenger", "nomad"];
+            let active: Vec<u32> = self.store.active_indices().collect();
+
+            // 先重置所有分类, 再按规则标记精英
+            for &idx in &active {
+                let ptype = self.store.personality_types[idx as usize];
+                let is_attacker = attacker_types.contains(&ptype);
+                // 战斗型自动精英, 或近期有过攻击的
+                let has_attacked_recently = self.store.cold.days_since_attack(idx) < 7 && self.store.total_attacks[idx as usize] > 0;
+                self.store.cold.set_is_elite(idx, is_attacker || has_attacked_recently);
+            }
+
+            // 限制精英数量 (最多 10000)
+            let mut elite_count = active.iter().filter(|&&idx| self.store.cold.is_elite(idx)).count();
+            if elite_count > 10000 {
+                // 超额时, 按总等级排序, 只保留前 10000
+                let mut sorted: Vec<u32> = active.iter().filter(|&&idx| self.store.cold.is_elite(idx)).copied().collect();
+                sorted.sort_by_key(|&idx| self.store.total_level(idx));
+                // 降级多余的
+                for &idx in sorted.iter().take(elite_count - 10000) {
+                    self.store.cold.set_is_elite(idx, false);
+                }
+            }
+        }
+
+        // ═════ Phase C: 并行收集攻击订单 (只针对精英) ═════
         let mut attack_orders: Vec<AttackOrder>;
         {
             use rayon::prelude::*;
@@ -269,11 +301,11 @@ impl GameEngine {
             let alli_ptr: usize = &self.alliances as *const HashMap<u32, AllianceData> as usize;
             let grid_ptr: usize = &self.spatial_grid as *const HashMap<(i64, i64, i64), Vec<u32>> as usize;
 
-            // 找出有攻击意愿的玩家
+            // 找出有攻击意愿的精英玩家
             let attackers: Vec<u32> = active_b.iter()
                 .filter(|&&idx| {
                     let s = unsafe { &*(store_ptr as *const EntityStore) };
-                    s.is_ruins[idx as usize] == 0 && player::derive_max_attacks(s, idx) > 0
+                    s.is_ruins[idx as usize] == 0 && s.cold.is_elite(idx) && player::derive_max_attacks(s, idx) > 0
                 })
                 .copied().collect();
 
@@ -459,7 +491,7 @@ impl GameEngine {
         self.store.cold.set_boldness(idx, personality[2]);
         self.store.cold.set_sociability(idx, personality[3]);
         self.store.cold.set_emotionality(idx, personality[4]);
-        self.store.cold.set_invites_remaining(idx, if inviter.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) });
+        self.store.cold.set_invites_remaining(idx, 255); // 无限邀请 (高配置)
         self.store.cold.set_invited_by(idx, inviter);
         self.store.creation_time[i] = self.time.saturating_sub(86401);
         self.store.last_collect_time[i] = self.time;
@@ -554,20 +586,23 @@ impl GameEngine {
         let active: Vec<u32> = self.store.active_indices().collect();
         if active.is_empty() { return; }
 
-        let density = (active.len() as f64 / 50000.0).min(1.0);
-        let density_factor = (1.0 - density).max(0.05);
+        let density = (active.len() as f64 / 100_000_000.0).min(1.0);
+        let density_factor = (1.0 - density).max(0.1);
 
         let mut inviters = Vec::new();
         for &idx in &active {
             let i = idx as usize;
-            if self.store.cold.invites_remaining(idx) == 0 { continue; }
+            // if self.store.cold.invites_remaining(idx) == 0 { continue; } // 无限邀请, 跳过检查
             if self.store.is_newbie_until[i] > self.time { continue; }
 
             let is_invited = self.store.cold.invited_by(idx).is_some();
-            let base = if is_invited { 0.03 } else { 0.015 };
+            // 高邀请配置: 用于测试千万级玩家
+            let base_prob = if is_invited { 0.15 } else { 0.10 };
             let s = self.store.cold.sociability(idx) as f64 / 100.0;
             let lv = self.store.total_level(idx) as f64 / 100.0;
-            let prob = (base + s * if is_invited { 0.04 } else { 0.03 } + lv * if is_invited { 0.03 } else { 0.02 }) * density_factor;
+            let prob = (base_prob
+                + s * if is_invited { 0.15 } else { 0.10 }
+                + lv * if is_invited { 0.08 } else { 0.05 }) * density_factor;
 
             if self.rng.gen::<f64>() < prob {
                 inviters.push((idx, self.store.x[i]));
@@ -576,8 +611,8 @@ impl GameEngine {
 
         for (inviter_idx, inviter_x) in inviters {
             let ii = inviter_idx as usize;
-            if self.store.cold.invites_remaining(inviter_idx) == 0 { continue; }
-            self.store.cold.set_invites_remaining(inviter_idx, self.store.cold.invites_remaining(inviter_idx) - 1);
+            // if self.store.cold.invites_remaining(inviter_idx) == 0 { continue; } // 无限
+            // 不减了
             self.store.cold.set_referral_count(inviter_idx, self.store.cold.referral_count(inviter_idx) + 1);
 
             // 奖励邀请者

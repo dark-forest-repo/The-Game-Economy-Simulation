@@ -268,6 +268,37 @@ pub fn update_emotion_daily(store: &mut EntityStore, idx: u32, _day: u64) -> boo
     c.burnout(idx) > 90 || (c.consecutive_losses(idx) > 10 && emo > 0.6) || (store.total_deaths[idx as usize] > 5 && c.burnout(idx) > 50)
 }
 
+/// 计算玩家当前资源能升几级 (避免盲目试 20 次)
+pub fn count_affordable_upgrades(store: &EntityStore, idx: u32, is_post_scarcity: bool, priority: &[&str; 5]) -> usize {
+    let i = idx as usize;
+    let energy = store.energy[i];
+    let dft = store.dft[i];
+    let min_reserve = derive_min_energy(store, idx);
+    let mut count = 0;
+
+    for sys in priority {
+        let lv = match *sys {
+            "collector" => store.collector_lv[i] as u128,
+            "weapon" => store.weapon_lv[i] as u128,
+            "shield" => store.shield_lv[i] as u128,
+            "radar" => store.radar_lv[i] as u128,
+            "engine" => store.engine_lv[i] as u128,
+            _ => continue,
+        } as usize;
+
+        let cost_e = if is_post_scarcity { m::calc_upgrade_energy(sys, lv as u128) * 3 } else { m::calc_upgrade_energy(sys, lv as u128) };
+        let cost_d = if is_post_scarcity { 0 } else { m::calc_upgrade_cost(sys, lv as u128) };
+
+        // 按优先级一个一个检查
+        let remaining_energy = energy.saturating_sub(cost_e * (count as u128 + 1) + min_reserve);
+        let remaining_dft = dft.saturating_sub(cost_d * (count as u128 + 1));
+        if remaining_energy > 0 && (is_post_scarcity || remaining_dft > 0) {
+            count += 1;
+        }
+    }
+    count.min(30)
+}
+
 /// 重建
 pub fn try_rebuild(store: &mut EntityStore, idx: u32, is_post_scarcity: bool) -> bool {
     let i = idx as usize;

@@ -1,10 +1,12 @@
-// Dark Forest 游戏模拟器 — SoA 版
+// Dark Forest 游戏模拟器 — SoA + 混合模型 + GPU (可选)
 mod math_engine;
 mod player;
 mod store;
 mod coldstore;
 mod engine;
 mod battle_engine;
+#[cfg(feature = "gpu")]
+mod gpu_compute;
 
 use std::time::Instant;
 use engine::{SimConfig, GameEngine};
@@ -41,8 +43,9 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
                 if ap.is_empty() { 0.0 } else { ap.iter().map(|&idx| engine.store.total_level(idx) as f64).sum::<f64>() / ap.len() as f64 / 5.0 }
             };
             let wars = engine.alliances.values().filter(|a| !a.war_targets.is_empty()).count();
-            println!("  Y{:2} | alive={:5} dead={:5} | Lv={:5.1} | burn={:5.1}% PS={}⚔️{} | mkt={}E/DFT",
-                engine.day / 365, active, engine.store.ids.len() - active, avg_lv, burn,
+            let elite = engine.store.active_indices().filter(|&idx| engine.store.cold.is_elite(idx)).count();
+            println!("  Y{:2} | alive={:5} dead={:5} | Lv={:5.1} elite={:5} | burn={:5.1}% PS={}⚔️{} | mkt={}E/DFT",
+                engine.day / 365, active, engine.store.ids.len() - active, avg_lv, elite, burn,
                 if engine.global_state.is_post_scarcity() { "Y" } else { "." },
                 wars, engine.market_rate);
         }
@@ -52,7 +55,6 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
     let active: Vec<_> = engine.store.active_indices().collect();
     let total_players = engine.store.ids.len();
 
-    // 人格分布
     let mut pcount: HashMap<&str, usize> = HashMap::new();
     for &idx in &active { *pcount.entry(engine.store.personality_types[idx as usize]).or_insert(0) += 1; }
     let mut sorted: Vec<_> = pcount.into_iter().collect();
@@ -62,7 +64,6 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
     let total_alliances = engine.alliances.len();
     let wars_now = engine.alliances.values().filter(|a| !a.war_targets.is_empty()).count();
 
-    // 顶级玩家
     let top = active.iter().max_by_key(|&&idx| engine.store.total_level(idx)).copied();
     let top_s = match top {
         Some(idx) => {
@@ -83,7 +84,7 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
 
     println!("\n  ════════ 总结 ════════");
     println!("  耗时: {:.2}s", elapsed.as_secs_f64());
-    println!("  存活: {}/{}", active.len(), total_players);
+    println!("  存活: {}/{} (精英: {})", active.len(), total_players, active.iter().filter(|&&idx| engine.store.cold.is_elite(idx)).count());
     if let Some(d) = ps_day { println!("  后稀缺: Year {} (Day {})", d / 365, d); }
     if let Some(d) = se_day { println!("  发行完毕: Year {} (Day {})", d / 365, d); }
     println!("  联盟: {} | 战争中: {}", total_alliances, wars_now);
@@ -124,6 +125,7 @@ fn main() {
         }
         _ => {
             eprintln!("场景: decade | 30yr | fast | competition | big [天] [初始] | custom <天> <初始> <日流>");
+            eprintln!("GPU: cargo run --features gpu -- <场景>");
         }
     }
 }

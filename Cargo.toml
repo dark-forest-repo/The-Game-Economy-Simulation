@@ -9,7 +9,13 @@ rand = "0.8"
 hex = "0.4"
 rayon = "1.5"
 memmap2 = "0.9"
-# no serde, no clap — keeping dependency-free for max compile speed
+wgpu = { version = "22.0", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1.14", features = ["derive"], optional = true }
+
+[features]
+default = []
+gpu = ["wgpu", "pollster", "bytemuck"]
 
 [profile.release]
 opt-level = 3

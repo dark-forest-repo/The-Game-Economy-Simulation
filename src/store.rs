@@ -129,7 +129,7 @@ impl EntityStore {
         c.set_consecutive_wins(idx, 0); c.set_consecutive_losses(idx, 0);
         c.set_days_since_attack(idx, 0); c.set_days_since_death(idx, 0);
         c.set_generation(idx, 0);
-        c.set_invites_remaining(idx, 0); c.set_invited_by(idx, None);
+        c.set_invites_remaining(idx, 255); c.set_invited_by(idx, None);
         c.set_referral_count(idx, 0);
     }
 
