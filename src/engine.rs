@@ -10,6 +10,8 @@ use crate::math_engine as m;
 use crate::player::{self, PersonalityPreset, SPAWN_DISTRIBUTION};
 use crate::store::EntityStore;
 use crate::battle_engine::{BattleEngine, AttackOrder};
+#[cfg(feature = "gpu")]
+use crate::gpu_compute::{GpuContext, CohortGpu};
 
 // ═══════════════════════════════════════════════════════════
 // 配置
@@ -118,6 +120,9 @@ pub struct GameEngine {
     pub market_daily_volume: u128, pub market_daily_trades: usize,
 
     battle_engine: BattleEngine,
+
+    #[cfg(feature = "gpu")]
+    gpu: Option<GpuContext>,
 }
 
 impl GameEngine {
@@ -137,10 +142,104 @@ impl GameEngine {
             market_rate: 100, market_dft_fees: 0,
             market_daily_volume: 0, market_daily_trades: 0,
             battle_engine: BattleEngine::new(),
+            #[cfg(feature = "gpu")]
+            gpu: None,
         }
     }
 
     pub fn active_count(&self) -> usize { self.store.active_indices().count() }
+
+    #[cfg(feature = "gpu")]
+    fn ensure_gpu(&mut self) {
+        if self.gpu.is_none() {
+            match pollster::block_on(GpuContext::new()) {
+                Ok(ctx) => { self.gpu = Some(ctx); eprintln!("  GPU initialized"); }
+                Err(e) => eprintln!("  GPU init failed: {}", e),
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn process_mass_cohorts_gpu(&mut self) {
+        let ctx = match self.gpu.as_ref() { Some(c) => c, None => return };
+
+        // Group mass players into cohorts by (personality_type, level_bucket)
+        let mut cohorts: Vec<CohortGpu> = Vec::new();
+        let mut cohort_map: std::collections::HashMap<(&str, u32), usize> = std::collections::HashMap::new();
+
+        for idx in self.store.active_indices() {
+            if self.store.cold.is_elite(idx) { continue; } // 只处理群众
+
+            let bucket = self.store.total_level(idx) / 10; // 每10级一段
+            let ptype = self.store.personality_types[idx as usize];
+            let key = (ptype, bucket);
+
+            let cohort_idx = if let Some(&c) = cohort_map.get(&key) { c }
+            else {
+                let c = cohorts.len();
+                cohorts.push(CohortGpu {
+                    count: 0, avg_collector_lv: 0, avg_weapon_lv: 0,
+                    avg_shield_lv: 0, avg_radar_lv: 0, avg_engine_lv: 0,
+                    total_energy_lo: 0, total_energy_hi: 0,
+                    total_dft_lo: 0, total_dft_hi: 0,
+                    deaths: 0, upgrades: 0,
+                });
+                cohort_map.insert(key, c);
+                c
+            };
+
+            let c = &mut cohorts[cohort_idx];
+            c.count += 1;
+            c.avg_collector_lv += self.store.collector_lv[idx as usize] as u32;
+            c.avg_weapon_lv += self.store.weapon_lv[idx as usize] as u32;
+            c.avg_shield_lv += self.store.shield_lv[idx as usize] as u32;
+            c.avg_radar_lv += self.store.radar_lv[idx as usize] as u32;
+            c.avg_engine_lv += self.store.engine_lv[idx as usize] as u32;
+                    c.total_energy_lo += self.store.energy[idx as usize] as u32;
+            c.total_dft_lo += self.store.dft[idx as usize] as u32;
+        }
+
+        // 平均化
+        for c in &mut cohorts {
+            if c.count > 0 {
+                c.avg_collector_lv /= c.count;
+                c.avg_weapon_lv /= c.count;
+                c.avg_shield_lv /= c.count;
+                c.avg_radar_lv /= c.count;
+                c.avg_engine_lv /= c.count;
+            }
+        }
+
+        if cohorts.is_empty() { return; }
+
+        // GPU 计算
+        ctx.run_cohort(&mut cohorts);
+
+        // 将结果写回 store
+        for (key, cohort_idx) in &cohort_map {
+            let c = &cohorts[*cohort_idx];
+            if c.deaths > 0 || c.upgrades > 0 {
+                // 找到这个 cohort 的玩家并应用结果
+                // (简化: 随机选 c.deaths 个杀掉)
+                let members: Vec<u32> = self.store.active_indices()
+                    .filter(|&idx| {
+                        if self.store.cold.is_elite(idx) { return false; }
+                        let bucket = self.store.total_level(idx) / 10;
+                        let ptype = self.store.personality_types[idx as usize];
+                        (ptype, bucket) == *key
+                    }).collect();
+
+                // 随机杀
+                if c.deaths > 0 && c.deaths as usize <= members.len() {
+                    let mut rng = rand::thread_rng();
+                    let to_kill: Vec<&u32> = members.choose_multiple(&mut rng, c.deaths as usize).collect();
+                    for &&idx in &to_kill {
+                        self.store.is_ruins[idx as usize] = 1;
+                    }
+                }
+            }
+        }
+    }
 
     // ═══════════════════════════════════════════
     // 主循环
@@ -258,6 +357,13 @@ impl GameEngine {
 
             self.total_dft_burned += *burned_agg.lock().unwrap();
             self.total_quits += *quits_agg.lock().unwrap();
+        }
+
+        // ═════ GPU 群众队列处理 ═════
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu.is_none() { self.ensure_gpu(); }
+            self.process_mass_cohorts_gpu();
         }
 
         // ═════ Hybrid: 精英/群众分类 ═════

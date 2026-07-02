@@ -6,7 +6,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-/// GPU 队列数据 (80 字节对齐)
+/// GPU 队列数据 (48 字节)
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct CohortGpu {
@@ -16,14 +16,12 @@ pub struct CohortGpu {
     pub avg_shield_lv: u32,
     pub avg_radar_lv: u32,
     pub avg_engine_lv: u32,
-    pub _pad: [u32; 2],      // 对齐
-    pub total_energy_lo: u64, // 低 64 位 (近似)
-    pub total_energy_hi: u64, // 高 64 位
-    pub total_dft_lo: u64,
-    pub total_dft_hi: u64,
+    pub total_energy_lo: u32,
+    pub total_energy_hi: u32,
+    pub total_dft_lo: u32,
+    pub total_dft_hi: u32,
     pub deaths: u32,
     pub upgrades: u32,
-    pub _pad2: [u32; 2],
 }
 
 /// GPU 上下文
@@ -36,7 +34,7 @@ pub struct GpuContext {
 
 impl GpuContext {
     pub async fn new() -> Result<Self, String> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN, // AMD GPU → Vulkan
             ..Default::default()
         });
@@ -53,9 +51,10 @@ impl GpuContext {
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
+                    label: None,
                     required_features: wgpu::Features::empty(),
                     required_limits: wgpu::Limits::default(),
-                    label: None,
+                    memory_hints: wgpu::MemoryHints::Performance,
                 },
                 None,
             )
@@ -104,6 +103,8 @@ impl GpuContext {
             layout: Some(&pipeline_layout),
             module: &shader,
             entry_point: "main",
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
         });
 
         Ok(Self { device, queue, pipeline, bind_group_layout })
@@ -114,58 +115,81 @@ impl GpuContext {
         let n = cohorts.len().max(1) as u64;
         let size = std::mem::size_of::<CohortGpu>() as u64;
 
-        // 创建 GPU buffer
-        let input_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cohort_input"),
+        // 上传 buffer (MAP_WRITE → COPY_SRC)
+        let upload_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cohort_upload"),
             size: n * size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: true,
         });
-        // 写数据
         {
-            let mut view = input_buf.slice(..).get_mapped_range_mut();
+            let mut view = upload_buf.slice(..).get_mapped_range_mut();
             let bytes = bytemuck::cast_slice_mut::<u8, CohortGpu>(bytemuck::cast_slice_mut(&mut view));
             bytes.copy_from_slice(cohorts);
         }
-        input_buf.unmap();
+        upload_buf.unmap();
 
-        let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cohort_output"),
+        // 输入 buffer (STORAGE_READ)
+        let storage_in = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cohort_in"),
             size: n * size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        // Bind group
+        // 输出 buffer (STORAGE_READ_WRITE)
+        let storage_out = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cohort_out"),
+            size: n * size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // 读回 buffer (MAP_READ + COPY_DST)
+        let readback_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cohort_readback"),
+            size: n * size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Copy upload → storage_in
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.copy_buffer_to_buffer(&upload_buf, 0, &storage_in, 0, n * size);
+
+        // Bind group (storage_in read-only, storage_out read-write)
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cohort_bg"),
             layout: &self.bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: input_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: output_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: storage_in.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: storage_out.as_entire_binding() },
             ],
         });
 
-        // Dispatch
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        // Dispatch compute
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(n as u32, 1, 1);
         }
+
+        // Copy storage_out → readback
+        encoder.copy_buffer_to_buffer(&storage_out, 0, &readback_buf, 0, n * size);
+
         self.queue.submit(Some(encoder.finish()));
 
         // 读回结果
         {
-            let slice = output_buf.slice(..);
+            let slice = readback_buf.slice(..);
             slice.map_async(wgpu::MapMode::Read, |_| {});
             self.device.poll(wgpu::Maintain::Wait);
             let view = slice.get_mapped_range();
             let result: &[CohortGpu] = bytemuck::cast_slice(&view);
             cohorts.copy_from_slice(result);
         }
-        output_buf.unmap();
+        readback_buf.unmap();
     }
 }
 
@@ -177,14 +201,12 @@ struct Cohort {
     avg_shield_lv: u32,
     avg_radar_lv: u32,
     avg_engine_lv: u32,
-    _pad: vec2<u32>,
-    total_energy_lo: u64,
-    total_energy_hi: u64,
-    total_dft_lo: u64,
-    total_dft_hi: u64,
+    total_energy_lo: u32,
+    total_energy_hi: u32,
+    total_dft_lo: u32,
+    total_dft_hi: u32,
     deaths: u32,
     upgrades: u32,
-    _pad2: vec2<u32>,
 }
 
 @group(0) @binding(0) var<storage, read> input: array<Cohort>;
@@ -194,19 +216,19 @@ struct Cohort {
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
     let c = input[i];
-    if c.count == 0u32 { return; }
+    if (c.count == 0u) { return; }
 
     var out = c;
 
-    // 简单采集: 每队列每人每天 +2000 能量 (近似)
-    let collected = u64(c.count) * 2000u64;
-    out.total_energy_lo += collected;
+    // 采集: 每人每天 +200 能量 (近似, u32 够用)
+    let collected = c.count * 200u;
+    out.total_energy_lo = out.total_energy_lo + collected;
 
-    // 简单升级: 能量 > 50000 就升级
-    if out.total_energy_lo > 50000u64 && c.avg_collector_lv < 100u32 {
-        out.avg_collector_lv += 1u32;
-        out.upgrades += 1u32;
-        out.total_energy_lo -= 50000u64;
+    // 升级: 能量 > 5000 就升级
+    if (out.total_energy_lo > 5000u && c.avg_collector_lv < 100u) {
+        out.avg_collector_lv = out.avg_collector_lv + 1u;
+        out.upgrades = out.upgrades + 1u;
+        out.total_energy_lo = out.total_energy_lo - 5000u;
     }
 
     output[i] = out;
