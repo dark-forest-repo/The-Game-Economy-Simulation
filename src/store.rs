@@ -76,6 +76,7 @@ impl EntityStore {
     pub fn alloc(&mut self) -> u32 {
         let idx = if let Some(free) = self.free_list.pop() { free }
         else { let i = self.next_id; self.next_id += 1; self._grow_to(i as usize + 1); i };
+        self.cold.ensure(idx); // ← 必须先 ensure 再写
         self._reset_at(idx as usize);
         self.cold.ensure(idx);
         idx
