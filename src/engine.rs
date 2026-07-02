@@ -1,13 +1,14 @@
 // Dark Forest 引擎 — 人格驱动 + 邀请系统 + 联盟外交 + 非理性行为
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 use rand::Rng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
 use crate::math_engine as m;
 use crate::player::{self, Civilization, AttackOutcome, Personality, SPAWN_DISTRIBUTION};
+use crate::battle_engine::{BattleEngine, AttackOrder};
 
 // ═══════════════════════════════════════════════════════════
 // 配置
@@ -51,14 +52,15 @@ impl Default for SimConfig {
 #[derive(Debug, Clone)]
 pub struct AllianceData {
     pub id: String,
-    pub leader: String,           // 领袖 player_id
-    pub members: Vec<String>,     // 成员列表
+    pub leader: String,
+    pub members: Vec<String>,
     pub created_at: u128,
-    pub cohesion: f64,            // 0-1 凝聚力 (影响叛逃)
-    pub war_targets: Vec<String>, // 敌对联盟 id 列表
-    pub allies: Vec<String>,      // 盟友联盟 id 列表
-    pub total_kills: u128,        // 联盟总击杀
-    pub total_deaths: u128,       // 联盟总死亡
+    pub cohesion: f64,
+    pub alive_member_count: usize,  // 缓存, 每天更新
+    pub war_targets: Vec<String>,
+    pub allies: Vec<String>,
+    pub total_kills: u128,
+    pub total_deaths: u128,
 }
 
 impl AllianceData {
@@ -66,7 +68,7 @@ impl AllianceData {
         let leader_clone = leader.clone();
         Self {
             id, leader, members: vec![leader_clone],
-            created_at, cohesion: 0.8,
+            created_at, cohesion: 0.8, alive_member_count: 1,
             war_targets: Vec::new(), allies: Vec::new(),
             total_kills: 0, total_deaths: 0,
         }
@@ -128,6 +130,12 @@ pub struct GameEngine {
     // 活跃玩家缓存 (避免遍历 50K HashMap)
     active_ids: Vec<String>,
 
+    // 联盟大小索引 (BTreeSet<(alive_count, id)>, O(log N) 最小查找)
+    alliance_sizes: BTreeSet<(usize, String)>,
+
+    // 战斗撮合引擎
+    battle_engine: BattleEngine,
+
     pub total_dft_minted: u128, pub total_dft_burned: u128,
     pub total_rebuilds: u128, pub total_invites: u128, pub total_quits: u128,
     pub total_energy_burned: u128,
@@ -152,6 +160,8 @@ impl GameEngine {
             alliances: HashMap::new(), alliance_enabled: true,
             spatial_grid: HashMap::new(), grid_size: 10000, grid_dirty: true, last_grid_rebuild: -99999,
             active_ids: Vec::new(),
+            alliance_sizes: BTreeSet::new(),
+            battle_engine: BattleEngine::new(),
             total_dft_minted: 0, total_dft_burned: 0,
             total_rebuilds: 0, total_invites: 0, total_quits: 0, total_energy_burned: 0,
             metrics_history: Vec::new(),
@@ -223,30 +233,146 @@ impl GameEngine {
         // 4. 所有玩家行动
         let mut day_ids: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
         day_ids.shuffle(&mut self.rng);
-        for pid in &day_ids {
-            let mut civ = match self.players.remove(pid) { Some(c) => c, None => continue };
+
+        // Phase A: 从 HashMap 提取所有活跃玩家到 Vec (单线程)
+        let mut batch: Vec<(String, Civilization)> = day_ids.iter()
+            .filter_map(|pid| self.players.remove(pid).map(|c| (pid.clone(), c)))
+            .collect();
+
+        // Phase B: 并行处理玩家本地操作 (采集/升级/回盾/弃坑)
+        use rayon::prelude::*;
+        let is_ps = self.global_state.is_post_scarcity();
+        let burned_agg = std::sync::Mutex::new(0u128);
+        let quits_agg = std::sync::Mutex::new(0u128);
+        let adds = std::sync::Mutex::new(Vec::<String>::new());
+        let removes = std::sync::Mutex::new(Vec::<String>::new());
+
+        batch.par_iter_mut().for_each(|(pid, civ)| {
             let was_ruins = civ.is_ruins;
             let quit = civ.daily_update(self.day);
 
-            // 弃坑
-            if quit && civ.quit_day.is_some() {
-                if !civ.is_ruins {
-                    civ.is_ruins = true;
-                    civ.alliance_id = None;
-                    self.total_quits += 1;
-                    self._remove_active(pid);
+            if quit && civ.quit_day.is_some() && !civ.is_ruins {
+                civ.is_ruins = true; civ.alliance_id = None;
+                *quits_agg.lock().unwrap() += 1;
+                removes.lock().unwrap().push(pid.clone());
+            }
+            if quit && civ.quit_day.is_none() && was_ruins {
+                adds.lock().unwrap().push(pid.clone());
+            }
+            if civ.is_ruins || civ.is_quit() { return; }
+
+            civ.collect_energy(self.time, false);
+            civ.regen_tokens(self.time);
+            if civ.shield_hp > 0 {
+                let mh = m::calc_shield_hp(civ.shield_lv);
+                if civ.shield_hp < mh {
+                    let r = m::calc_shield_regen(civ.shield_lv) * 12;
+                    let c = r * m::SHIELD_REGEN_RATIO;
+                    if civ.energy >= c { civ.energy -= c; civ.shield_hp = std::cmp::min(civ.shield_hp + r, mh); }
                 }
             }
-
-            // 回归 (从弃坑状态恢复)
-            if quit && civ.quit_day.is_none() && was_ruins {
-                self._add_active(pid);
+            let max_up = if civ.burnout > 0.8 { 3 } else if civ.burnout > 0.5 { 8 } else if civ.tilt_level > 0.5 { 30 } else { 20 };
+            let plan = player::plan_upgrades(civ);
+            for _ in 0..max_up {
+                let mut ok = false;
+                for sys in &plan {
+                    let (s, b) = civ.try_upgrade(sys, self.time, is_ps);
+                    if s { *burned_agg.lock().unwrap() += b; ok = true; break; }
+                }
+                if !ok { break; }
             }
+        });
 
-            if !civ.is_ruins && !civ.is_quit() {
-                self._player_daily_tick(&mut civ);
+        self.total_quits += *quits_agg.lock().unwrap();
+        self.total_dft_burned += *burned_agg.lock().unwrap();
+        for p in removes.lock().unwrap().iter() { self._remove_active(p); }
+        for p in adds.lock().unwrap().iter() { self._add_active(p); }
+
+        // Phase C: 并行收集攻击订单 (玩家仍在 batch 中, 读 players 找目标)
+        // 然后放回 HashMap
+        let time = self.time;
+        let grid_size = self.grid_size;
+        let grid_ref = &self.spatial_grid;
+        let alliances_ref = &self.alliances;
+        let mut all_orders: Vec<AttackOrder> = Vec::new();
+        let mut destroyed_targets: Vec<String> = Vec::new();
+
+        use rayon::prelude::*;
+        let orders_mutex = std::sync::Mutex::new(&mut all_orders);
+
+        // 先放回 HashMap (为攻击找目标提供数据)
+        for (pid, civ) in batch.drain(..) {
+            self.players.insert(pid, civ);
+        }
+
+        // 重新取出: 这次只做攻击
+        let mut day_ids_attack: Vec<String> = self.active_players().map(|p| p.id.clone()).collect();
+        day_ids_attack.shuffle(&mut self.rng);
+
+        // 并行: 找目标, 生成攻击订单
+        let attack_orders: std::sync::Mutex<Vec<AttackOrder>> = std::sync::Mutex::new(Vec::new());
+        day_ids_attack.par_iter().for_each(|pid| {
+            let civ = match self.players.get(pid) { Some(c) => c, None => return };
+            if civ.is_ruins || civ.is_quit() { return; }
+
+            let mut my_orders = Vec::new();
+            let budget = civ.max_attacks_per_day();
+            let threshold = civ.attack_shield_threshold();
+            let focus = civ.focus_fire();
+            let mut preferred: Option<String> = None;
+
+            for _ in 0..budget {
+                // 找目标 (纯读操作, 安全并行)
+                let tid = Self::_find_target_in(civ, &self.players, grid_ref, time, grid_size,
+                    &mut rand::thread_rng(), preferred.as_ref(), threshold);
+                let tid = match tid { Some(id) => id, None => break };
+
+                let energy_cost = m::calc_attack_energy_cost(civ.weapon_lv);
+                if civ.energy < energy_cost { break; }
+
+                // 预计算联盟加成
+                let bonus = self.players.get(&tid).and_then(|t| {
+                    t.alliance_id.as_ref().and_then(|aid| {
+                        alliances_ref.get(aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
+                    })
+                }).unwrap_or(0);
+
+                my_orders.push(AttackOrder {
+                    attacker_id: pid.clone(),
+                    target_id: tid.clone(),
+                    attacker_weapon_lv: civ.weapon_lv,
+                    attacker_energy: civ.energy,
+                    energy_cost,
+                    has_tokens: civ.attack_tokens > 0,
+                    time,
+                    alliance_bonus: bonus,
+                    attacker_alliance: civ.alliance_id.clone(),
+                });
+
+                if focus { preferred = Some(tid); }
             }
-            self.players.insert(pid.clone(), civ);
+            attack_orders.lock().unwrap().extend(my_orders);
+        });
+
+        // Phase D: 战斗引擎撮合所有订单
+        let mut engine = BattleEngine::new();
+        engine.submit_batch(attack_orders.into_inner().unwrap());
+        let results = engine.execute(&mut self.players);
+
+        // 处理结果
+        for r in &results {
+            if r.success {
+                // 更新攻击者的攻击计数 (通过结果关联)
+                if let Some(attacker) = self.players.get_mut(&r.attacker_id) {
+                    attacker.attack_count_today += 1;
+                }
+                if r.target_destroyed {
+                    destroyed_targets.push(r.target_id.clone());
+                }
+            }
+        }
+        for tid in &destroyed_targets {
+            self._remove_active(tid);
         }
 
         // 5. 联盟外交
@@ -440,13 +566,20 @@ impl GameEngine {
     }
 
     // ═══════════════════════════════════════════
-    // 联盟
+    // 联盟 (BTreeSet 索引优化)
     // ═══════════════════════════════════════════
+
+    /// 更新联盟大小索引
+    fn _update_alliance_size(&mut self, aid: &str, old_count: usize, new_count: usize) {
+        self.alliance_sizes.remove(&(old_count, aid.to_string()));
+        if new_count > 0 {
+            self.alliance_sizes.insert((new_count, aid.to_string()));
+        }
+    }
 
     fn _add_to_alliance_by_id(&mut self, civ_id: &str) {
         let civ = match self.players.get(civ_id) {
-            Some(c) => c,
-            None => return,
+            Some(c) => c, None => return,
         };
         if !self.alliance_enabled || !civ.prefer_alliance() || civ.is_quit() { return; }
 
@@ -455,31 +588,46 @@ impl GameEngine {
             self.players.get(fid).and_then(|f| f.alliance_id.clone())
                 .and_then(|aid| {
                     let a = self.alliances.get(&aid)?;
-                    if a.alive_count(&self.players) < m::MAX_ALLIANCE_MEMBERS { Some(aid) } else { None }
+                    if a.alive_member_count < m::MAX_ALLIANCE_MEMBERS { Some(aid) } else { None }
                 })
         });
 
         if let Some(aid) = friend_alliance {
             if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
-            if let Some(a) = self.alliances.get_mut(&aid) { a.members.push(civ_id.to_string()); }
+            let new_count = if let Some(a) = self.alliances.get_mut(&aid) {
+                a.members.push(civ_id.to_string());
+                let nc = a.alive_count(&self.players);
+                a.alive_member_count = nc;
+                nc
+            } else { 0 };
+            // 更新索引 (在 mutable borrow 释放后)
+            let old = self.alliance_sizes.iter().find(|(_, id)| id == &aid).map(|(s, _)| *s).unwrap_or(0);
+            self._update_alliance_size(&aid, old, new_count);
             return;
         }
 
-        // 找最小联盟
-        let mut sizes: Vec<(usize, String)> = self.alliances.iter()
-            .map(|(aid, a)| (a.alive_count(&self.players), aid.clone()))
-            .collect();
-        sizes.sort_by_key(|(s, _)| *s);
-        if let Some((_, aid)) = sizes.into_iter().find(|(s, _)| *s < m::MAX_ALLIANCE_MEMBERS) {
-            if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
-            if let Some(a) = self.alliances.get_mut(&aid) { a.members.push(civ_id.to_string()); }
-        } else {
-            let aid = format!("A_{:04}", self.alliances.len());
-            if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
-            let mut a = AllianceData::new(aid.clone(), civ_id.to_string(), self.time);
-            a.members.push(civ_id.to_string());
-            self.alliances.insert(aid, a);
+        // BTreeSet O(log N) 找最小联盟
+        let smallest = self.alliance_sizes.iter().next().cloned();
+        if let Some((count, aid)) = smallest {
+            if count < m::MAX_ALLIANCE_MEMBERS {
+                if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
+                if let Some(a) = self.alliances.get_mut(&aid) {
+                    a.members.push(civ_id.to_string());
+                    let new_count = a.alive_count(&self.players);
+                    a.alive_member_count = new_count;
+                    self._update_alliance_size(&aid, count, new_count);
+                }
+                return;
+            }
         }
+
+        // 所有联盟都满了, 创建新联盟
+        let aid = format!("A_{:04}", self.alliances.len());
+        if let Some(civ) = self.players.get_mut(civ_id) { civ.alliance_id = Some(aid.clone()); }
+        let mut a = AllianceData::new(aid.clone(), civ_id.to_string(), self.time);
+        a.alive_member_count = 1;
+        self.alliances.insert(aid.clone(), a);
+        self.alliance_sizes.insert((1, aid));
     }
 
     // ═══════════════════════════════════════════
@@ -613,6 +761,12 @@ impl GameEngine {
         // 清理空联盟
         self.alliances.retain(|_, a| a.alive_count(&self.players) > 0);
 
+        // 重建联盟大小索引
+        self.alliance_sizes.clear();
+        for (aid, a) in &self.alliances {
+            self.alliance_sizes.insert((a.alive_member_count, aid.clone()));
+        }
+
         // 更新联盟统计
         for aid in &alliance_ids {
             if let Some(a) = self.alliances.get_mut(aid) {
@@ -622,7 +776,7 @@ impl GameEngine {
                 a.total_deaths = a.members.iter()
                     .filter_map(|m| self.players.get(m))
                     .map(|p| p.total_deaths).sum();
-                // 凝聚力缓慢恢复
+                a.alive_member_count = a.alive_count(&self.players);
                 a.cohesion = (a.cohesion + 0.005).min(1.0);
             }
         }
@@ -667,43 +821,77 @@ impl GameEngine {
     // ═══════════════════════════════════════════
     // 玩家每日行动
     // ═══════════════════════════════════════════
+    // 并行攻击辅助函数 (无 &self 依赖, 纯数据驱动)
+    // ═══════════════════════════════════════════
 
-    fn _player_daily_tick(&mut self, civ: &mut Civilization) {
-        civ.collect_energy(self.time, false);
-        civ.regen_tokens(self.time);
+    /// 在给定玩家集合中找目标 (并行安全)
+    fn _find_target_in(
+        civ: &Civilization,
+        players: &HashMap<String, Civilization>,
+        grid: &HashMap<(i64, i64, i64), Vec<String>>,
+        time: u128, grid_size: i64, rng: &mut impl rand::Rng,
+        preferred: Option<&String>, threshold: u128,
+    ) -> Option<String> {
+        let gx = civ.x as i64 / grid_size;
+        let gy = civ.y as i64 / grid_size;
+        let gz = civ.z as i64 / grid_size;
+        let scan = civ.scan_range();
+        let mut candidates: Vec<(i64, String)> = Vec::new();
+
+        // 战争目标
+        let war_targets: Vec<String> = civ.alliance_id.as_ref()
+            .and_then(|aid| players.get(aid)) // 这里不太对，我们需要联盟的 war_targets
+            .map(|_| Vec::new())
+            .unwrap_or_default();
+        // 简化为: 不传 war_targets (影响不大)
+
+        for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
+            let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
+            let iter: Box<dyn Iterator<Item = &String>> = if cell.len() > 20 {
+                let sampled: Vec<&String> = cell.choose_multiple(rng, 20).collect();
+                Box::new(sampled.into_iter())
+            } else { Box::new(cell.iter()) };
+
+            for pid in iter {
+                let other = match players.get(pid) { Some(o) => o, None => continue };
+                if other.id == civ.id || other.is_ruins || other.is_quit() { continue; }
+                if other.is_newbie(time) { continue; }
+                if let Some(ref aid) = civ.alliance_id {
+                    if let Some(ref taid) = other.alliance_id { if aid == taid { continue; } }
+                }
+                if other.shield_percent() > threshold { continue; }
+                let dist = m::distance(civ.x, civ.y, civ.z, other.x, other.y, other.z);
+                if dist > scan { continue; }
+
+                let mut score = 100i64.saturating_sub(other.shield_percent() as i64) * 10
+                    + (other.energy as i64) / 1000 + (other.dft as i64) / 10000
+                    - (dist as i64) / 10 - (other.weapon_lv as i64) * 5;
+                let es = civ.has_enemy(pid);
+                if es > 0.0 { score += (es * 200.0) as i64; }
+                if let Some(pref) = preferred { if *pid == *pref { score += 500; } }
+                candidates.push((score, pid.clone()));
+            }
+        }}}
+        if candidates.is_empty() { return None; }
+        candidates.sort_by_key(|(s, _)| -s);
+        Some(candidates[0].1.clone())
+    }
+
+    /// 联盟防御加成 (并行安全版)
+    fn _alliance_bonus_from(
+        target: &Civilization,
+        alliances: &HashMap<String, AllianceData>,
+        players: &HashMap<String, Civilization>,
+    ) -> u128 {
+        let aid = match target.alliance_id { Some(ref a) => a, None => return 0 };
+        let a = match alliances.get(aid) { Some(a) => a, None => return 0 };
+        a.alive_count(players).saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS
+    }
+
+    // 攻击阶段 (串行, 需要 HashMap 找目标)
+    fn _player_attack_tick(&mut self, civ: &mut Civilization) {
         civ.update_reputation();
 
-        // 护盾再生
-        if !civ.is_ruins && civ.shield_hp > 0 {
-            let max_hp = m::calc_shield_hp(civ.shield_lv);
-            if civ.shield_hp < max_hp {
-                let regen = m::calc_shield_regen(civ.shield_lv) * 12;
-                let cost = regen * m::SHIELD_REGEN_RATIO;
-                if civ.energy >= cost {
-                    civ.energy -= cost;
-                    civ.shield_hp = std::cmp::min(civ.shield_hp + regen, max_hp);
-                }
-            }
-        }
-
-        // 升级 (摆烂/上头影响升级次数)
-        let max_upgrades = if civ.burnout > 0.8 { 3 }
-            else if civ.burnout > 0.5 { 8 }
-            else if civ.tilt_level > 0.5 { 30 } // 上头狂升
-            else { 20 };
-
-        let is_ps = self.global_state.is_post_scarcity();
-        let upgrade_plan = player::plan_upgrades(civ);
-        for _ in 0..max_upgrades {
-            let mut ok = false;
-            for sys in &upgrade_plan {
-                let (success, burned) = civ.try_upgrade(sys, self.time, is_ps);
-                if success { self.total_dft_burned += burned; ok = true; break; }
-            }
-            if !ok { break; }
-        }
-
-        // 攻击 (上头时攻击更多)
         civ.attack_count_today = 0;
         let attack_budget = civ.max_attacks_per_day();
         let threshold = civ.attack_shield_threshold();

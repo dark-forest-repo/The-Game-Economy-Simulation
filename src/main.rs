@@ -4,6 +4,7 @@
 mod math_engine;
 mod player;
 mod engine;
+mod battle_engine;
 
 use std::time::Instant;
 use engine::{SimConfig, GameEngine};
