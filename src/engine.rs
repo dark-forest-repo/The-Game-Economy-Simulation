@@ -371,16 +371,15 @@ impl GameEngine {
         let gx = store.x[i] as i64 / grid_size;
         let gy = store.y[i] as i64 / grid_size;
         let gz = store.z[i] as i64 / grid_size;
-        let scan = player::scan_range(store, idx);
+        let scan = store.scan_range[i] as u128;  // 预计算!
         let scan_sq = scan * scan;
         let mut candidates = Vec::with_capacity(64);
+        let mut thread_rng = rand::thread_rng(); // 每线程独立 RNG
 
         for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
             let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
-            // 格子里人多就抽样
             let iter: Vec<&u32> = if cell.len() > 20 {
-                // 抽样需要 Rng, 但我们没有 &mut Rng. 简化: 取前20个
-                cell.iter().take(20).collect()
+                cell.choose_multiple(&mut thread_rng, 20).collect() // 恢复随机抽样
             } else { cell.iter().collect() };
 
             for &&tidx in &iter {

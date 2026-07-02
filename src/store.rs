@@ -30,6 +30,7 @@ pub struct EntityStore {
     pub creation_time: Vec<u64>,
     pub max_health: Vec<u32>,
     pub collector_durability: Vec<u64>,
+    pub scan_range: Vec<u32>,          // 预计算扫描范围
 
     // ── 半热 (战争联盟用) ──
     pub total_attacks: Vec<u32>,
@@ -63,7 +64,7 @@ impl EntityStore {
             attack_tokens: Vec::new(), shield_durability: Vec::new(),
             is_ruins: Vec::new(), alliance_idx: Vec::new(), is_newbie_until: Vec::new(),
             last_collect_time: Vec::new(), last_token_time: Vec::new(), creation_time: Vec::new(),
-            max_health: Vec::new(), collector_durability: Vec::new(),
+            max_health: Vec::new(), collector_durability: Vec::new(), scan_range: Vec::new(),
             total_attacks: Vec::new(), total_victims: Vec::new(), total_deaths: Vec::new(),
             enemies: Vec::new(),
             ids: Vec::new(), addresses: Vec::new(), names: Vec::new(),
@@ -92,7 +93,7 @@ impl EntityStore {
         grow!(attack_tokens, 0); grow!(shield_durability, 0);
         grow!(is_ruins, 1); grow!(alliance_idx, None); grow!(is_newbie_until, 0);
         grow!(last_collect_time, 0); grow!(last_token_time, 0);
-        grow!(creation_time, 0); grow!(max_health, 0); grow!(collector_durability, 0);
+        grow!(creation_time, 0); grow!(max_health, 0); grow!(collector_durability, 0); grow!(scan_range, 0);
         grow!(total_attacks, 0); grow!(total_victims, 0); grow!(total_deaths, 0);
         grow!(enemies, Vec::new());
         grow!(ids, String::new()); grow!(addresses, String::new());
@@ -107,7 +108,7 @@ impl EntityStore {
         self.attack_tokens[i] = 3; self.shield_durability[i] = 259200;
         self.is_ruins[i] = 0; self.alliance_idx[i] = None; self.is_newbie_until[i] = u64::MAX;
         self.last_collect_time[i] = 0; self.last_token_time[i] = 0; self.creation_time[i] = 0;
-        self.max_health[i] = 20000; self.collector_durability[i] = 86400;
+        self.max_health[i] = 20000; self.collector_durability[i] = 86400; self.scan_range[i] = crate::math_engine::calc_radar(1) as u32;
         self.total_attacks[i] = 0; self.total_victims[i] = 0; self.total_deaths[i] = 0;
         self.enemies[i].clear();
         self.ids[i].clear(); self.addresses[i].clear(); self.names[i].clear();

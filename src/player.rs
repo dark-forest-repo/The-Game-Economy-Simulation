@@ -123,7 +123,7 @@ pub fn derive_prefer_alliance(store: &EntityStore, idx: u32) -> bool {
 }
 
 pub fn scan_range(store: &EntityStore, idx: u32) -> u128 {
-    m::calc_radar(store.radar_lv[idx as usize] as u128)
+    store.scan_range[idx as usize] as u128
 }
 
 pub fn collect_rate(store: &EntityStore, idx: u32) -> u128 {
@@ -230,7 +230,7 @@ pub fn try_upgrade(store: &mut EntityStore, idx: u32, system: &str, is_post_scar
             let new_max = m::calc_shield_hp(store.shield_lv[i] as u128);
             store.shield_hp[i] = if old_max > 0 && store.shield_hp[i] > 0 { store.shield_hp[i] * new_max / old_max } else { new_max };
         }
-        "radar" => store.radar_lv[i] += 1,
+        "radar" => { store.radar_lv[i] += 1; store.scan_range[i] = m::calc_radar(store.radar_lv[i] as u128) as u32; }
         "engine" => store.engine_lv[i] += 1,
         _ => {}
     }
