@@ -597,7 +597,7 @@ impl GameEngine {
         self.store.cold.set_boldness(idx, personality[2]);
         self.store.cold.set_sociability(idx, personality[3]);
         self.store.cold.set_emotionality(idx, personality[4]);
-        self.store.cold.set_invites_remaining(idx, 255); // 无限邀请 (高配置)
+        self.store.cold.set_invites_remaining(idx, if inviter.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) });
         self.store.cold.set_invited_by(idx, inviter);
         self.store.creation_time[i] = self.time.saturating_sub(86401);
         self.store.last_collect_time[i] = self.time;
@@ -692,23 +692,20 @@ impl GameEngine {
         let active: Vec<u32> = self.store.active_indices().collect();
         if active.is_empty() { return; }
 
-        let density = (active.len() as f64 / 100_000_000.0).min(1.0);
-        let density_factor = (1.0 - density).max(0.1);
+        let density = (active.len() as f64 / 50000.0).min(1.0);
+        let density_factor = (1.0 - density).max(0.05);
 
         let mut inviters = Vec::new();
         for &idx in &active {
             let i = idx as usize;
-            // if self.store.cold.invites_remaining(idx) == 0 { continue; } // 无限邀请, 跳过检查
+            if self.store.cold.invites_remaining(idx) == 0 { continue; }
             if self.store.is_newbie_until[i] > self.time { continue; }
 
             let is_invited = self.store.cold.invited_by(idx).is_some();
-            // 高邀请配置: 用于测试千万级玩家
-            let base_prob = if is_invited { 0.15 } else { 0.10 };
+            let base = if is_invited { 0.03 } else { 0.015 };
             let s = self.store.cold.sociability(idx) as f64 / 100.0;
             let lv = self.store.total_level(idx) as f64 / 100.0;
-            let prob = (base_prob
-                + s * if is_invited { 0.15 } else { 0.10 }
-                + lv * if is_invited { 0.08 } else { 0.05 }) * density_factor;
+            let prob = (base + s * if is_invited { 0.04 } else { 0.03 } + lv * if is_invited { 0.03 } else { 0.02 }) * density_factor;
 
             if self.rng.gen::<f64>() < prob {
                 inviters.push((idx, self.store.x[i]));
@@ -717,8 +714,8 @@ impl GameEngine {
 
         for (inviter_idx, inviter_x) in inviters {
             let ii = inviter_idx as usize;
-            // if self.store.cold.invites_remaining(inviter_idx) == 0 { continue; } // 无限
-            // 不减了
+            if self.store.cold.invites_remaining(inviter_idx) == 0 { continue; }
+            self.store.cold.set_invites_remaining(inviter_idx, self.store.cold.invites_remaining(inviter_idx) - 1);
             self.store.cold.set_referral_count(inviter_idx, self.store.cold.referral_count(inviter_idx) + 1);
 
             // 奖励邀请者
@@ -934,7 +931,7 @@ impl GameEngine {
         if tv > 0 {
             let tbd: u128 = buy.iter().take(10).map(|(_, n)| n).sum();
             let dp = if tbd > 0 { (tv as f64) / (tbd as f64) } else { 0.5 };
-            self.market_rate = ((self.market_rate as f64 * (1.0 + (dp - 0.5) * 0.1)) as u128).clamp(10, 10000);
+            self.market_rate = ((self.market_rate as f64 * (1.0 + (dp - 0.5) * 0.1)) as u128).max(10);
         }
         self.market_daily_volume = tv;
     }

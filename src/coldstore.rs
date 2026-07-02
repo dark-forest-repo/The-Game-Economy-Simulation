@@ -8,7 +8,7 @@ use memmap2::MmapMut;
 use std::fs::OpenOptions;
 
 const SLOT_SIZE: usize = 128;
-const INITIAL_CAPACITY: usize = 2_000_000; // 200万起步
+const INITIAL_CAPACITY: usize = 2_000_000; // 200万起步 // 200万起步
 
 // 字段偏移 (手工计算, 紧凑排列)
 const O_DFT_SPENT: usize = 0;     // 16
