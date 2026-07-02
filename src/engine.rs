@@ -256,59 +256,83 @@ impl GameEngine {
             self.total_quits += *quits_agg.lock().unwrap();
         }
 
-        // ═════ Phase C: 收集攻击订单 ═════
-        let time = self.time;
-        let grid_size = self.grid_size;
-        let mut attack_orders: Vec<AttackOrder> = Vec::new();
+        // ═════ Phase C: 并行收集攻击订单 (Rayon) ═════
+        let mut attack_orders: Vec<AttackOrder>;
+        {
+            use rayon::prelude::*;
+            use std::sync::Mutex;
+            let time = self.time;
+            let grid_size = self.grid_size;
 
-        for &idx in &active_b {
-            let i = idx as usize;
-            if self.store.is_ruins[i] == 1 { continue; }
+            // 提取所有需要的引用为原始指针 (绕过 borrow checker)
+            let store_ptr: usize = &mut self.store as *mut EntityStore as usize;
+            let alli_ptr: usize = &self.alliances as *const HashMap<u32, AllianceData> as usize;
+            let grid_ptr: usize = &self.spatial_grid as *const HashMap<(i64, i64, i64), Vec<u32>> as usize;
 
-            let budget = player::derive_max_attacks(&self.store, idx);
-            if budget == 0 { continue; }
-            let threshold = player::derive_attack_shield_threshold(&self.store, idx);
-            let focus = player::derive_focus_fire(&self.store, idx);
+            // 找出有攻击意愿的玩家
+            let attackers: Vec<u32> = active_b.iter()
+                .filter(|&&idx| {
+                    let s = unsafe { &*(store_ptr as *const EntityStore) };
+                    s.is_ruins[idx as usize] == 0 && player::derive_max_attacks(s, idx) > 0
+                })
+                .copied().collect();
 
-            // 搜一次网格
-            let candidates = self._find_targets(idx);
-            let mut submitted = std::collections::HashSet::new();
-            let mut player_orders = 0usize;
+            let orders_mutex: Mutex<Vec<AttackOrder>> = Mutex::new(Vec::new());
 
-            for &(_, tidx) in &candidates {
-                if player_orders >= budget { break; }
-                let t = tidx as usize;
-                if self.store.shield_percent(tidx) > threshold { continue; }
+            attackers.par_iter().for_each(|&idx| {
+                let store = unsafe { &mut *(store_ptr as *mut EntityStore) };
+                let grid = unsafe { &*(grid_ptr as *const HashMap<(i64, i64, i64), Vec<u32>>) };
+                let alliances = unsafe { &*(alli_ptr as *const HashMap<u32, AllianceData>) };
 
-                let energy_cost = m::calc_attack_energy_cost(self.store.weapon_lv[i] as u128);
-                if self.store.energy[i] < energy_cost * (attack_orders.len() as u128 + 1) { break; }
+                let i = idx as usize;
+                if store.is_ruins[i] == 1 { return; }
+                let budget = player::derive_max_attacks(store, idx);
+                let threshold = player::derive_attack_shield_threshold(store, idx);
+                let focus = player::derive_focus_fire(store, idx);
 
-                let bonus = self.store.alliance_idx[t].and_then(|aid| {
-                    self.alliances.get(&aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
-                }).unwrap_or(0);
+                // 搜一次网格 (只读)
+                let candidates = Self::_find_targets_in(store, grid, idx, grid_size, time);
+                let mut submitted = std::collections::HashSet::new();
+                let mut player_orders = 0usize;
+                let mut my_orders: Vec<AttackOrder> = Vec::new();
 
-                // 杀敌预估
-                let num_orders = if focus {
-                    let atk = m::calc_attack(self.store.weapon_lv[i] as u128);
-                    let def = m::calc_defense(self.store.shield_lv[t] as u128) + bonus;
-                    let dmg = if atk > def { (atk - def) * 2 + (atk + m::SHIELD_DMG_BONUS - def).max(0) } else { 0 };
-                    if dmg > 0 { ((self.store.health[t] + self.store.shield_hp[t] + dmg - 1) / dmg).min(10) as usize } else { 1 }
-                } else { 1 };
-
-                if submitted.contains(&tidx) && !focus { continue; }
-
-                for _ in 0..num_orders {
+                for &(_, tidx) in &candidates {
                     if player_orders >= budget { break; }
-                    attack_orders.push(AttackOrder {
-                        attacker_idx: idx, target_idx: tidx,
-                        weapon_lv: self.store.weapon_lv[i], energy_cost, has_tokens: self.store.attack_tokens[i] > 0,
-                        time, alliance_bonus: bonus, attacker_alliance: self.store.alliance_idx[i],
-                    });
-                    player_orders += 1;
+                    let t = tidx as usize;
+                    if store.shield_percent(tidx) > threshold { continue; }
+                    let energy_cost = m::calc_attack_energy_cost(store.weapon_lv[i] as u128);
+                    if store.energy[i] < energy_cost * (player_orders as u128 + 1) { break; }
+
+                    let bonus = store.alliance_idx[t].and_then(|aid| {
+                        alliances.get(&aid).map(|a| a.alive_member_count.saturating_sub(1) as u128 * m::ALLIANCE_DEF_BONUS)
+                    }).unwrap_or(0);
+
+                    let num = if focus {
+                        let atk = m::calc_attack(store.weapon_lv[i] as u128);
+                        let def = m::calc_defense(store.shield_lv[t] as u128) + bonus;
+                        let dmg = if atk > def { (atk - def) * 2 + (atk + m::SHIELD_DMG_BONUS - def).max(0) } else { 0 };
+                        if dmg > 0 { ((store.health[t] + store.shield_hp[t] + dmg - 1) / dmg).min(10) } else { 1 }
+                    } else { 1 };
+
+                    if submitted.contains(&tidx) && !focus { continue; }
+                    for _ in 0..num {
+                        if player_orders >= budget { break; }
+                        my_orders.push(AttackOrder {
+                            attacker_idx: idx, target_idx: tidx,
+                            weapon_lv: store.weapon_lv[i], energy_cost,
+                            has_tokens: store.attack_tokens[i] > 0,
+                            time, alliance_bonus: bonus,
+                            attacker_alliance: store.alliance_idx[i],
+                        });
+                        player_orders += 1;
+                    }
+                    submitted.insert(tidx);
+                    if focus { break; }
                 }
-                submitted.insert(tidx);
-                if focus { break; }
-            }
+                orders_mutex.lock().unwrap().extend(my_orders);
+            });
+
+            attack_orders = orders_mutex.into_inner().unwrap();
         }
 
         // ═════ Phase D: 战斗引擎 ═════
@@ -337,48 +361,60 @@ impl GameEngine {
     // 寻找目标 (网格一次)
     // ═══════════════════════════════════════════
 
-    fn _find_targets(&mut self, idx: u32) -> Vec<(i64, u32)> {
+    // 网格搜索 (免 &self, 引用传入)
+    fn _find_targets_in(
+        store: &EntityStore,
+        grid: &HashMap<(i64, i64, i64), Vec<u32>>,
+        idx: u32, grid_size: i64, time: u64,
+    ) -> Vec<(i64, u32)> {
         let i = idx as usize;
-        let gx = self.store.x[i] as i64 / self.grid_size;
-        let gy = self.store.y[i] as i64 / self.grid_size;
-        let gz = self.store.z[i] as i64 / self.grid_size;
-        let scan = player::scan_range(&self.store, idx);
+        let gx = store.x[i] as i64 / grid_size;
+        let gy = store.y[i] as i64 / grid_size;
+        let gz = store.z[i] as i64 / grid_size;
+        let scan = player::scan_range(store, idx);
         let scan_sq = scan * scan;
-        let mut candidates = Vec::new();
+        let mut candidates = Vec::with_capacity(64);
 
         for dx in -1i64..=1 { for dy in -1i64..=1 { for dz in -1i64..=1 {
-            let cell = match self.spatial_grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
+            let cell = match grid.get(&(gx + dx, gy + dy, gz + dz)) { Some(c) => c, None => continue };
+            // 格子里人多就抽样
             let iter: Vec<&u32> = if cell.len() > 20 {
-                cell.choose_multiple(&mut self.rng, 20).collect()
+                // 抽样需要 Rng, 但我们没有 &mut Rng. 简化: 取前20个
+                cell.iter().take(20).collect()
             } else { cell.iter().collect() };
 
             for &&tidx in &iter {
                 let t = tidx as usize;
-                if tidx == idx || self.store.is_ruins[t] == 1 { continue; }
-                if self.store.is_newbie_until[t] > self.time { continue; }
-                if let Some(aaid) = self.store.alliance_idx[i] {
-                    if let Some(taid) = self.store.alliance_idx[t] { if aaid == taid { continue; } }
+                if tidx == idx || store.is_ruins[t] == 1 { continue; }
+                if store.is_newbie_until[t] > time { continue; }
+                if let Some(aaid) = store.alliance_idx[i] {
+                    if let Some(taid) = store.alliance_idx[t] { if aaid == taid { continue; } }
                 }
-
-                let dx = (self.store.x[i] - self.store.x[t]).unsigned_abs();
-                let dy = (self.store.y[i] - self.store.y[t]).unsigned_abs();
-                let dz = (self.store.z[i] - self.store.z[t]).unsigned_abs();
+                // 平方距离过滤 (免 isqrt)
+                let dx = (store.x[i] - store.x[t]).unsigned_abs();
+                let dy = (store.y[i] - store.y[t]).unsigned_abs();
+                let dz = (store.z[i] - store.z[t]).unsigned_abs();
                 if dx * dx + dy * dy + dz * dz > scan_sq { continue; }
 
                 let dist = m::isqrt(dx * dx + dy * dy + dz * dz);
-                let sp = self.store.shield_percent(tidx);
+                let sp = store.shield_percent(tidx);
                 let mut score = (100i64 - sp as i64) * 10
-                    + (self.store.energy[t] as i64) / 1000 + (self.store.dft[t] as i64) / 10000
-                    - (dist as i64) / 10 - (self.store.weapon_lv[t] as i64) * 5;
-                let es = self.store.has_enemy(idx, tidx);
-                if es > 0 { score += (es as i64) * 2; } // severity * 2
+                    + (store.energy[t] as i64) / 1000 + (store.dft[t] as i64) / 10000
+                    - (dist as i64) / 10 - (store.weapon_lv[t] as i64) * 5;
+                let es = store.has_enemy(idx, tidx);
+                if es > 0 { score += (es as i64) * 2; }
                 candidates.push((score, tidx));
             }
         }}}
 
         candidates.sort_by_key(|(s, _)| -s);
-        if candidates.len() > 100 { candidates.truncate(100); }
+        candidates.truncate(100);
         candidates
+    }
+
+    // 旧版: 用 &mut self (只用在外交等需要 Rng 的地方)
+    fn _find_targets(&mut self, idx: u32) -> Vec<(i64, u32)> {
+        Self::_find_targets_in(&self.store, &self.spatial_grid, idx, self.grid_size, self.time)
     }
 
     // ═══════════════════════════════════════════
