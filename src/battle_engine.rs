@@ -122,7 +122,7 @@ impl BattleEngine {
                     let actual = std::cmp::min(dft_plunder, store.dft[t]);
                     store.dft[t] -= actual;
                     store.dft[a] += actual;
-                    store.total_dft_earned[a] += actual;
+                    store.cold.set_dft_earned(o.attacker_idx, store.cold.dft_earned(o.attacker_idx) + actual);
                 }
 
                 if result.defender_destroyed {
@@ -136,14 +136,14 @@ impl BattleEngine {
                 if store.shield_durability[t] > 0 { store.shield_durability[t] -= 1; }
 
                 // 情绪
-                store.elation[a] = (store.elation[a] as u16 + if result.defender_destroyed { 15 } else { 5 }).min(100) as u8;
-                store.anger[a] = (store.anger[a] as i16 - 5).max(0) as u8;
-                store.consecutive_wins[a] += 1;
-                store.consecutive_losses[a] = 0;
+                store.cold.set_elation(o.attacker_idx, (store.cold.elation(o.attacker_idx) as u16 + if result.defender_destroyed { 15 } else { 5 }).min(100) as u8);
+                store.cold.set_anger(o.attacker_idx, (store.cold.anger(o.attacker_idx) as i16 - 5).max(0) as u8);
+                store.cold.set_consecutive_wins(o.attacker_idx, store.cold.consecutive_wins(o.attacker_idx) + 1);
+                store.cold.set_consecutive_losses(o.attacker_idx, 0);
 
-                store.anger[t] = (store.anger[t] as u16 + 25).min(100) as u8;
-                let fear_add = (15.0 * (1.0 - (store.boldness[t] as f64 / 100.0))) as u16;
-                store.fear[t] = (store.fear[t] as u16 + fear_add).min(100) as u8;
+                store.cold.set_anger(o.target_idx, (store.cold.anger(o.target_idx) as u16 + 25).min(100) as u8);
+                let fear_add = (15.0 * (1.0 - (store.cold.boldness(o.target_idx) as f64 / 100.0))) as u16;
+                store.cold.set_fear(o.target_idx, (store.cold.fear(o.target_idx) as u16 + fear_add).min(100) as u8);
 
                 // 仇人
                 store.add_enemy(tidx, o.attacker_idx, 50);

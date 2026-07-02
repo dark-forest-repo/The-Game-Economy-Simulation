@@ -1,4 +1,4 @@
-// Dark Forest 玩家模块 — SoA 版: 所有函数接受 (store, idx)
+// Dark Forest 玩家模块 — SoA + ColdStore 版
 #![allow(dead_code)]
 
 use crate::math_engine as m;
@@ -28,10 +28,10 @@ impl PersonalityPreset {
     pub fn berserker() -> Self { Self { name: "berserker", aggression: 100, greed: 30, boldness: 100, sociability: 0, emotionality: 90 } }
 
     pub fn jitter(&self, rng: &mut impl rand::Rng) -> [u8; 5] {
-        fn jitter_val(v: u8, rng: &mut impl rand::Rng) -> u8 {
-            ((v as f64 + (rng.gen::<f64>() - 0.5) * 30.0).round().max(0.0).min(100.0)) as u8
+        fn jv(v: u8, r: &mut impl rand::Rng) -> u8 {
+            ((v as f64 + (r.gen::<f64>() - 0.5) * 30.0).round().max(0.0).min(100.0)) as u8
         }
-        [jitter_val(self.aggression, rng), jitter_val(self.greed, rng), jitter_val(self.boldness, rng), jitter_val(self.sociability, rng), jitter_val(self.emotionality, rng)]
+        [jv(self.aggression, rng), jv(self.greed, rng), jv(self.boldness, rng), jv(self.sociability, rng), jv(self.emotionality, rng)]
     }
 }
 
@@ -53,85 +53,73 @@ pub const SPAWN_DISTRIBUTION: &[(&str, f64)] = &[
     ("berserker", 0.07),
 ];
 
-/// 生成随机 EVM 地址
 pub fn random_evm_address(rng: &mut impl rand::Rng) -> String {
     let bytes: [u8; 20] = rng.gen();
     format!("0x{}", hex::encode(bytes))
 }
 
+// ── 快捷宏: 从 ColdStore 读/写 ──
+macro_rules! cget { ($s:expr, $idx:expr, $f:ident) => { $s.cold.$f($idx) }; }
+macro_rules! cset { ($s:expr, $idx:expr, $f:ident, $val:expr) => { $s.cold.set_$f($idx, $val); }; }
+
 // ═══════════════════════════════════════════════════════════
-// 行为推导 (store, idx) 版
+// 行为推导
 // ═══════════════════════════════════════════════════════════
-
-pub fn p(store: &EntityStore, idx: u32, field: fn(&EntityStore) -> &Vec<u8>) -> u8 {
-    field(store)[idx as usize]
-}
-
-macro_rules! pf {
-    ($store:expr, $idx:expr, $field:ident) => { $store.$field[$idx as usize] };
-}
-
-// 人格值转 f64
-fn pf64(store: &EntityStore, idx: u32, field: fn(&EntityStore) -> &Vec<u8>) -> f64 {
-    field(store)[idx as usize] as f64 / 100.0
-}
-
-macro_rules! pff {
-    ($store:expr, $idx:expr, $field:ident) => { $store.$field[$idx as usize] as f64 / 100.0 };
-}
 
 pub fn derive_max_attacks(store: &EntityStore, idx: u32) -> usize {
-    let a = pff!(store, idx, aggression);
-    let b = pff!(store, idx, boldness);
-    let ang = store.anger[idx as usize] as f64 / 100.0;
-    let ela = store.elation[idx as usize] as f64 / 100.0;
-    let fe = store.fear[idx as usize] as f64 / 100.0;
-    let tilt = store.tilt_level[idx as usize] as f64 / 100.0;
+    let c = &store.cold;
+    let a = c.aggression(idx) as f64 / 100.0;
+    let b = c.boldness(idx) as f64 / 100.0;
+    let ang = c.anger(idx) as f64 / 100.0;
+    let ela = c.elation(idx) as f64 / 100.0;
+    let fe = c.fear(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
     let raw = a * 80.0 + b * 40.0 + ang * 60.0 + ela * 30.0 - fe * 50.0 + tilt * 100.0;
     (raw.max(0.0) as usize).min(300)
 }
 
 pub fn derive_attack_shield_threshold(store: &EntityStore, idx: u32) -> u8 {
-    let b = pff!(store, idx, boldness);
-    let a = pff!(store, idx, aggression);
-    let ang = store.anger[idx as usize] as f64 / 100.0;
-    let ela = store.elation[idx as usize] as f64 / 100.0;
-    let fe = store.fear[idx as usize] as f64 / 100.0;
-    let tilt = store.tilt_level[idx as usize] as f64 / 100.0;
-    let raw = 30.0 + b * 30.0 + a * 40.0 + ang * 20.0 + ela * 10.0 - fe * 40.0 + tilt * 30.0;
-    raw.max(10.0).min(100.0) as u8
+    let c = &store.cold;
+    let a = c.aggression(idx) as f64 / 100.0;
+    let b = c.boldness(idx) as f64 / 100.0;
+    let ang = c.anger(idx) as f64 / 100.0;
+    let ela = c.elation(idx) as f64 / 100.0;
+    let fe = c.fear(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
+    (30.0 + b * 30.0 + a * 40.0 + ang * 20.0 + ela * 10.0 - fe * 40.0 + tilt * 30.0).max(10.0).min(100.0) as u8
 }
 
 pub fn derive_sell_energy_pct(store: &EntityStore, idx: u32) -> f64 {
-    let g = pff!(store, idx, greed);
-    let b = pff!(store, idx, boldness);
-    let fe = store.fear[idx as usize] as f64 / 100.0;
-    let ang = store.anger[idx as usize] as f64 / 100.0;
-    let ela = store.elation[idx as usize] as f64 / 100.0;
-    let tilt = store.tilt_level[idx as usize] as f64 / 100.0;
-    let burn = store.burnout[idx as usize] as f64 / 100.0;
-    let raw = g * 0.6 - b * 0.2 + fe * 0.3 - ang * 0.2 - ela * 0.1 - tilt * 0.3 + burn * 0.2;
-    raw.max(0.0).min(0.9)
+    let c = &store.cold;
+    let g = c.greed(idx) as f64 / 100.0;
+    let b = c.boldness(idx) as f64 / 100.0;
+    let fe = c.fear(idx) as f64 / 100.0;
+    let ang = c.anger(idx) as f64 / 100.0;
+    let ela = c.elation(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
+    let burn = c.burnout(idx) as f64 / 100.0;
+    (g * 0.6 - b * 0.2 + fe * 0.3 - ang * 0.2 - ela * 0.1 - tilt * 0.3 + burn * 0.2).max(0.0).min(0.9)
 }
 
 pub fn derive_min_energy(store: &EntityStore, idx: u32) -> u128 {
-    let fe = store.fear[idx as usize] as f64 / 100.0;
-    let b = pff!(store, idx, boldness);
-    let tilt = store.tilt_level[idx as usize] as f64 / 100.0;
-    let raw = 200.0 + fe * 10000.0 - b * 200.0 - tilt * 500.0;
-    (raw.max(50.0) as u128)
+    let c = &store.cold;
+    let fe = c.fear(idx) as f64 / 100.0;
+    let b = c.boldness(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
+    (200.0 + fe * 10000.0 - b * 200.0 - tilt * 500.0).max(50.0) as u128
 }
 
 pub fn derive_focus_fire(store: &EntityStore, idx: u32) -> bool {
-    let a = pff!(store, idx, aggression);
-    let e = pff!(store, idx, emotionality);
-    let ang = store.anger[idx as usize] as f64 / 100.0;
-    let tilt = store.tilt_level[idx as usize] as f64 / 100.0;
+    let c = &store.cold;
+    let a = c.aggression(idx) as f64 / 100.0;
+    let e = c.emotionality(idx) as f64 / 100.0;
+    let ang = c.anger(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
     (a * 0.4 + e * 0.4 + ang * 0.3 + tilt * 0.5) > 0.5
 }
 
 pub fn derive_prefer_alliance(store: &EntityStore, idx: u32) -> bool {
-    pff!(store, idx, sociability) > 0.3
+    store.cold.sociability(idx) as f64 / 100.0 > 0.3
 }
 
 pub fn scan_range(store: &EntityStore, idx: u32) -> u128 {
@@ -139,87 +127,60 @@ pub fn scan_range(store: &EntityStore, idx: u32) -> u128 {
 }
 
 pub fn collect_rate(store: &EntityStore, idx: u32) -> u128 {
-    let lv = store.collector_lv[idx as usize] as u128;
-    let refs = store.referral_count[idx as usize] as u128;
-    m::calc_collect(lv, refs)
+    m::calc_collect(store.collector_lv[idx as usize] as u128, store.cold.referral_count(idx) as u128)
 }
 
 // ═══════════════════════════════════════════════════════════
-// 升级规划 (SoA 版)
+// 升级规划
 // ═══════════════════════════════════════════════════════════
 
 const SYSTEMS: [&str; 5] = ["collector", "weapon", "shield", "radar", "engine"];
 
 fn sys_lv(store: &EntityStore, idx: u32, sys: &str) -> u128 {
+    let i = idx as usize;
     match sys {
-        "collector" => store.collector_lv[idx as usize] as u128,
-        "weapon" => store.weapon_lv[idx as usize] as u128,
-        "shield" => store.shield_lv[idx as usize] as u128,
-        "radar" => store.radar_lv[idx as usize] as u128,
-        "engine" => store.engine_lv[idx as usize] as u128,
+        "collector" => store.collector_lv[i] as u128,
+        "weapon" => store.weapon_lv[i] as u128,
+        "shield" => store.shield_lv[i] as u128,
+        "radar" => store.radar_lv[i] as u128,
+        "engine" => store.engine_lv[i] as u128,
         _ => 1,
     }
 }
 
 fn cost_efficiency(store: &EntityStore, idx: u32, sys: &str) -> f64 {
-    let l = sys_lv(store, idx, sys);
-    let cost = m::calc_upgrade_cost(sys, l) as f64;
+    let cost = m::calc_upgrade_cost(sys, sys_lv(store, idx, sys)) as f64;
     (1_000_000_000_000_000_000_000u128.saturating_sub(cost as u128) as f64 / 1_000_000_000_000_000_000_000.0).max(0.0)
 }
 
 pub fn calc_upgrade_scores(store: &EntityStore, idx: u32) -> [f64; 5] {
     let i = idx as usize;
-    let a = pff!(store, idx, aggression);
-    let g = pff!(store, idx, greed);
-    let b = pff!(store, idx, boldness);
-    let s = pff!(store, idx, sociability);
-    let ang = store.anger[i] as f64 / 100.0;
-    let fe = store.fear[i] as f64 / 100.0;
-    let ela = store.elation[i] as f64 / 100.0;
-    let bor = store.boredom[i] as f64 / 100.0;
-    let tilt = store.tilt_level[i] as f64 / 100.0;
-    let burn = store.burnout[i] as f64 / 100.0;
-    let energy = store.energy[i];
-    let col_dur = store.collector_durability[i];
-    let shield_hp = store.shield_hp[i];
-    let total_atk = store.total_attacks[i];
+    let c = &store.cold;
+    let a = c.aggression(idx) as f64 / 100.0;
+    let g = c.greed(idx) as f64 / 100.0;
+    let b = c.boldness(idx) as f64 / 100.0;
+    let s = c.sociability(idx) as f64 / 100.0;
+    let ang = c.anger(idx) as f64 / 100.0;
+    let fe = c.fear(idx) as f64 / 100.0;
+    let ela = c.elation(idx) as f64 / 100.0;
+    let bor = c.boredom(idx) as f64 / 100.0;
+    let tilt = c.tilt_level(idx) as f64 / 100.0;
+    let burn = c.burnout(idx) as f64 / 100.0;
+    let energy = store.energy[i]; let col_dur = store.collector_durability[i];
+    let shield_hp = store.shield_hp[i]; let total_atk = store.total_attacks[i];
 
     let scores = [
-        // collector
-        {
-            let need = if energy < 5000 { 0.3 } else { 0.0 } + if col_dur < 20000 { 0.2 } else { 0.0 };
-            need + g * 0.3 + (1.0 - a) * 0.2 + (1.0 - ang) * 0.1
-            + burn * 0.2 - tilt * 0.1 + cost_efficiency(store, idx, "collector") * 0.15
-        },
-        // weapon
-        {
-            let need = if sys_lv(store, idx, "weapon") < 3 { 0.2 } else { 0.0 };
-            need + a * 0.4 + (1.0 - b).max(0.0) * 0.1
-            + ang * 0.4 + ela * 0.2 - fe * 0.3
-            + tilt * 0.4 - burn * 0.1 + cost_efficiency(store, idx, "weapon") * 0.1
-        },
-        // shield
-        {
-            let max_hp = m::calc_shield_hp(sys_lv(store, idx, "shield"));
-            let need = if max_hp > 0 && shield_hp < max_hp / 3 { 0.4 } else { 0.0 };
-            need + (1.0 - b) * 0.3 + (1.0 - a) * 0.1
-            + fe * 0.5 - ang * 0.2 - ela * 0.1
-            - tilt * 0.2 + burn * 0.2 + cost_efficiency(store, idx, "shield") * 0.1
-        },
-        // radar
-        {
-            let need = if total_atk < 5 && sys_lv(store, idx, "radar") < 3 { 0.3 } else { 0.0 };
-            need + a * 0.15 + (1.0 - s) * 0.15 + b * 0.1
-            + ang * 0.1 + bor * 0.2
-            + tilt * 0.1 + cost_efficiency(store, idx, "radar") * 0.05
-        },
-        // engine
-        {
-            let need = if sys_lv(store, idx, "engine") < 2 { 0.2 } else { 0.0 };
-            need + fe * 0.3 + (1.0 - b) * 0.15 + b * 0.1
-            + fe * 0.3 + bor * 0.1
-            + tilt * 0.1 + burn * 0.1 + cost_efficiency(store, idx, "engine") * 0.05
-        },
+        { let need = if energy < 5000 { 0.3 } else { 0.0 } + if col_dur < 20000 { 0.2 } else { 0.0 };
+          need + g * 0.3 + (1.0 - a) * 0.2 + (1.0 - ang) * 0.1 + burn * 0.2 - tilt * 0.1 + cost_efficiency(store, idx, "collector") * 0.15 },
+        { let need = if sys_lv(store, idx, "weapon") < 3 { 0.2 } else { 0.0 };
+          need + a * 0.4 + (1.0 - b).max(0.0) * 0.1 + ang * 0.4 + ela * 0.2 - fe * 0.3 + tilt * 0.4 - burn * 0.1 + cost_efficiency(store, idx, "weapon") * 0.1 },
+        { let max_hp = m::calc_shield_hp(sys_lv(store, idx, "shield"));
+          let need = if max_hp > 0 && shield_hp < max_hp / 3 { 0.4 } else { 0.0 };
+          need + (1.0 - b) * 0.3 + (1.0 - a) * 0.1 + fe * 0.5 - ang * 0.2 - ela * 0.1 - tilt * 0.2 + burn * 0.2 + cost_efficiency(store, idx, "shield") * 0.1 },
+        { let need = if total_atk < 5 && sys_lv(store, idx, "radar") < 3 { 0.3 } else { 0.0 };
+          need + a * 0.15 + (1.0 - s) * 0.15 + b * 0.1 + ang * 0.1 + bor * 0.2 + tilt * 0.1 + cost_efficiency(store, idx, "radar") * 0.05 },
+        { let need = if sys_lv(store, idx, "engine") < 2 { 0.2 } else { 0.0 };
+          need + fe * 0.3 + (1.0 - b) * 0.15 + b * 0.1 + fe * 0.3 + bor * 0.1 + tilt * 0.1 + burn * 0.1 + cost_efficiency(store, idx, "engine") * 0.05 },
     ];
     scores
 }
@@ -232,36 +193,27 @@ pub fn plan_upgrades(store: &EntityStore, idx: u32) -> [&'static str; 5] {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 升级执行 (直接写 store)
+// 升级执行
 // ═══════════════════════════════════════════════════════════
 
-/// 尝试升级一个系统, 返回 (是否成功, 燃烧的 DFT)
 pub fn try_upgrade(store: &mut EntityStore, idx: u32, system: &str, is_post_scarcity: bool) -> (bool, u128) {
     let i = idx as usize;
     if store.is_ruins[i] == 1 { return (false, 0); }
-
     let lv = match system {
-        "collector" => store.collector_lv[i] as u128,
-        "weapon" => store.weapon_lv[i] as u128,
-        "shield" => store.shield_lv[i] as u128,
-        "radar" => store.radar_lv[i] as u128,
-        "engine" => store.engine_lv[i] as u128,
-        _ => return (false, 0),
+        "collector" => store.collector_lv[i] as u128, "weapon" => store.weapon_lv[i] as u128,
+        "shield" => store.shield_lv[i] as u128, "radar" => store.radar_lv[i] as u128,
+        "engine" => store.engine_lv[i] as u128, _ => return (false, 0),
     };
     if lv < 1 { return (false, 0); }
-
     let cost_dft = if is_post_scarcity { 0 } else { m::calc_upgrade_cost(system, lv) };
     let cost_energy = if is_post_scarcity { m::calc_upgrade_energy(system, lv) * 3 } else { m::calc_upgrade_energy(system, lv) };
     let min_reserve = derive_min_energy(store, idx);
-    let effective_min = if store.burnout[i] > 50 { min_reserve / 2 } else { min_reserve };
-
+    let effective_min = if store.cold.burnout(idx) > 50 { min_reserve / 2 } else { min_reserve };
     if !is_post_scarcity && store.dft[i] < cost_dft { return (false, 0); }
     if store.energy[i] < cost_energy + effective_min { return (false, 0); }
-
     if !is_post_scarcity { store.dft[i] -= cost_dft; }
     store.energy[i] = store.energy[i].saturating_sub(cost_energy);
-    store.total_dft_spent[i] += cost_dft;
-
+    store.cold.set_dft_spent(idx, store.cold.dft_spent(idx) + cost_dft);
     match system {
         "collector" => {
             let old_max = m::calc_max_durability(store.collector_lv[i] as u128);
@@ -276,9 +228,7 @@ pub fn try_upgrade(store: &mut EntityStore, idx: u32, system: &str, is_post_scar
             let old_max = m::calc_shield_hp(store.shield_lv[i] as u128);
             store.shield_lv[i] += 1;
             let new_max = m::calc_shield_hp(store.shield_lv[i] as u128);
-            store.shield_hp[i] = if old_max > 0 && store.shield_hp[i] > 0 {
-                store.shield_hp[i] * new_max / old_max
-            } else { new_max };
+            store.shield_hp[i] = if old_max > 0 && store.shield_hp[i] > 0 { store.shield_hp[i] * new_max / old_max } else { new_max };
         }
         "radar" => store.radar_lv[i] += 1,
         "engine" => store.engine_lv[i] += 1,
@@ -291,49 +241,31 @@ pub fn try_upgrade(store: &mut EntityStore, idx: u32, system: &str, is_post_scar
 // 情绪更新
 // ═══════════════════════════════════════════════════════════
 
-pub fn update_emotion_daily(store: &mut EntityStore, idx: u32, day: u64) -> bool {
-    let i = idx as usize;
-    let bold = pff!(store, idx, boldness);
-    let emo = pff!(store, idx, emotionality);
+pub fn update_emotion_daily(store: &mut EntityStore, idx: u32, _day: u64) -> bool {
+    let c = &mut store.cold;
+    let bold = c.boldness(idx) as f64 / 100.0;
+    let emo = c.emotionality(idx) as f64 / 100.0;
 
-    // 情绪衰减
-    store.anger[i] = (store.anger[i] as f64 * 0.92) as u8;
-    store.fear[i] = (store.fear[i] as f64 * 0.95) as u8;
-    store.elation[i] = (store.elation[i] as f64 * 0.90) as u8;
-    store.boredom[i] = ((store.boredom[i] as f64 * 0.98 + 2.0).min(100.0)) as u8;
+    c.set_anger(idx, (c.anger(idx) as f64 * 0.92) as u8);
+    c.set_fear(idx, (c.fear(idx) as f64 * 0.95) as u8);
+    c.set_elation(idx, (c.elation(idx) as f64 * 0.90) as u8);
+    c.set_boredom(idx, ((c.boredom(idx) as f64 * 0.98 + 2.0).min(100.0)) as u8);
 
-    store.days_since_last_attack[i] += 1;
-    store.days_since_last_death[i] += 1;
+    c.set_days_since_attack(idx, c.days_since_attack(idx) + 1);
+    c.set_days_since_death(idx, c.days_since_death(idx) + 1);
 
-    if store.days_since_last_attack[i] > 10 {
-        store.consecutive_wins[i] = 0;
-        store.consecutive_losses[i] = 0;
+    if c.days_since_attack(idx) > 10 { c.set_consecutive_wins(idx, 0); c.set_consecutive_losses(idx, 0); }
+    if c.days_since_attack(idx) > 20 { c.set_burnout(idx, (c.burnout(idx) as u16 + 1).min(100) as u8); }
+    if c.consecutive_losses(idx) > 5 { c.set_burnout(idx, (c.burnout(idx) as u16 + 5).min(100) as u8); }
+    if c.consecutive_wins(idx) > 3 { c.set_burnout(idx, (c.burnout(idx) as u16).saturating_sub(3) as u8); }
+
+    c.set_tilt_level(idx, ((c.tilt_level(idx) as f64 * 0.9) - 1.0).max(0.0) as u8);
+    if c.consecutive_losses(idx) > 2 {
+        let add = (c.consecutive_losses(idx) as u16 * 5).min(100) as u8;
+        c.set_tilt_level(idx, (c.tilt_level(idx) as u16 + add as u16).min(100) as u8);
     }
 
-    if store.days_since_last_attack[i] > 20 {
-        store.burnout[i] = (store.burnout[i] as u16 + 1).min(100) as u8;
-    }
-    if store.consecutive_losses[i] > 5 {
-        store.burnout[i] = (store.burnout[i] as u16 + 5).min(100) as u8;
-    }
-    if store.consecutive_wins[i] > 3 {
-        store.burnout[i] = (store.burnout[i] as u16).saturating_sub(3) as u8;
-    }
-
-    // 上头衰减
-    store.tilt_level[i] = ((store.tilt_level[i] as f64 * 0.9) - 1.0).max(0.0) as u8;
-    if store.consecutive_losses[i] > 2 {
-        let add = (store.consecutive_losses[i] as u16 * 5).min(100) as u8;
-        store.tilt_level[i] = (store.tilt_level[i] as u16 + add as u16).min(100) as u8;
-    }
-
-    // 弃坑检查
-    let should_quit = store.burnout[i] > 90
-        || (store.consecutive_losses[i] > 10 && emo > 0.6)
-        || (store.total_deaths[i] > 5 && store.burnout[i] > 50);
-
-    // 暂时返回 quit 标志 — 由调用方处理
-    should_quit
+    c.burnout(idx) > 90 || (c.consecutive_losses(idx) > 10 && emo > 0.6) || (store.total_deaths[idx as usize] > 5 && c.burnout(idx) > 50)
 }
 
 /// 重建
@@ -347,20 +279,20 @@ pub fn try_rebuild(store: &mut EntityStore, idx: u32, is_post_scarcity: bool) ->
     if !is_post_scarcity { store.dft[i] -= cost_dft; }
     store.energy[i] -= cost_energy;
 
-    // 凤凰涅槃
     let was_high = store.total_level(idx) >= 50;
     if was_high {
-        store.rebirth_count[i] += 1;
-        store.growth_multiplier[i] = (1.0 + store.rebirth_count[i] as f64 * 0.12).min(3.0) as f32;
+        let c = &mut store.cold;
+        c.set_rebirth_count(idx, c.rebirth_count(idx) + 1);
+        c.set_growth_multiplier(idx, (1.0 + c.rebirth_count(idx) as f64 * 0.12).min(3.0) as f32);
     }
 
     store.is_ruins[i] = 0;
-    store.health[i] = crate::math_engine::MAX_HEALTH / 2;
-    store.shield_hp[i] = crate::math_engine::calc_shield_hp(store.shield_lv[i] as u128) / 4;
-    store.collector_durability[i] = (crate::math_engine::calc_max_durability(store.collector_lv[i] as u128) / 4) as u64;
+    store.health[i] = m::MAX_HEALTH / 2;
+    store.shield_hp[i] = m::calc_shield_hp(store.shield_lv[i] as u128) / 4;
+    store.collector_durability[i] = (m::calc_max_durability(store.collector_lv[i] as u128) / 4) as u64;
     store.creation_time[i] = store.last_collect_time[i];
-    store.total_rebuilds[i] += 1;
-    store.fear[i] = (store.fear[i] as f64 * 0.5).max(10.0) as u8;
-    store.consecutive_losses[i] = 0;
+    store.cold.set_fear(idx, (store.cold.fear(idx) as f64 * 0.5).max(10.0) as u8);
+    store.cold.set_consecutive_losses(idx, 0);
+    store.cold.set_rebuilds(idx, store.cold.rebuilds(idx) + 1);
     true
 }

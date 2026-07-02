@@ -8,6 +8,7 @@ description = "Dark Forest game simulator — Rust port of the Python game_sim"
 rand = "0.8"
 hex = "0.4"
 rayon = "1.5"
+memmap2 = "0.9"
 # no serde, no clap — keeping dependency-free for max compile speed
 
 [profile.release]

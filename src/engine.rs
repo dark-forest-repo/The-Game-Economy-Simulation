@@ -172,72 +172,88 @@ impl GameEngine {
             }
         }
 
-        // ═════ Phase B: 采集/升级/情绪 (串行, SoA 数组操作) ═════
-        let is_ps = self.global_state.is_post_scarcity();
-        let active: Vec<u32> = self.store.active_indices().collect();
-        for &idx in &active {
-            let i = idx as usize;
-            if self.store.is_ruins[i] == 1 { continue; }
+        // ═════ Phase B: 并行采集/升级/情绪 (Rayon) ═════
+        let active_b: Vec<u32> = self.store.active_indices().collect();
+        {
+            use rayon::prelude::*;
+            use std::sync::Mutex;
+            let time = self.time;
+            let is_ps = self.global_state.is_post_scarcity();
+            let burned_agg = Mutex::new(0u128);
+            let quits_agg = Mutex::new(0u32);
 
-            // 情绪 & 弃坑
-            let quit = player::update_emotion_daily(&mut self.store, idx, self.day);
-            if quit {
-                self.store.is_ruins[i] = 1;
-                self.total_quits += 1;
-                self.grid_dirty = true;
-                continue;
-            }
+            let store_ptr: usize = &mut self.store as *mut EntityStore as usize;
+            let grid_dirty_ptr: usize = &mut self.grid_dirty as *mut bool as usize;
 
-            // 采集
-            let elapsed = self.time.saturating_sub(self.store.last_collect_time[i]);
-            if elapsed > 0 && self.store.collector_durability[i] > 0 {
-                let rate = player::collect_rate(&self.store, idx);
-                if rate > 0 {
-                    let ct = std::cmp::min(elapsed as u128, self.store.collector_durability[i] as u128);
-                    let gained = ct * rate;
-                    self.store.energy[i] += gained;
-                    self.store.collector_durability[i] -= ct as u64;
+            active_b.par_iter().for_each(|&idx| {
+                let store = unsafe { &mut *(store_ptr as *mut EntityStore) };
+                let i = idx as usize;
+                let store = unsafe { &mut *(store_ptr as *mut EntityStore) };
+
+                if store.is_ruins[i] == 1 { return; }
+                let quit = player::update_emotion_daily(store, idx, time);
+                if quit {
+                    store.is_ruins[i] = 1;
+                    *quits_agg.lock().unwrap() += 1;
+                    unsafe { *(grid_dirty_ptr as *mut bool) = true; }
+                    return;
                 }
-            }
-            self.store.last_collect_time[i] = self.time;
 
-            // Token 再生
-            let interval = m::calc_token_regen_interval(self.store.weapon_lv[i] as u128);
-            let interval_s = (interval / 100) as u64;
-            if interval_s > 0 {
-                let elapsed_t = self.time.saturating_sub(self.store.last_token_time[i]);
-                if elapsed_t >= interval_s {
-                    let regened = (elapsed_t / interval_s) as u8;
-                    let max_t = m::calc_max_tokens(self.store.weapon_lv[i] as u128) as u8;
-                    self.store.attack_tokens[i] = std::cmp::min(self.store.attack_tokens[i] as u16 + regened as u16, max_t as u16) as u8;
-                    self.store.last_token_time[i] = self.time;
-                }
-            }
-
-            // 护盾再生
-            if self.store.shield_hp[i] > 0 {
-                let max_hp = m::calc_shield_hp(self.store.shield_lv[i] as u128);
-                if self.store.shield_hp[i] < max_hp {
-                    let regen = m::calc_shield_regen(self.store.shield_lv[i] as u128) * 12;
-                    let cost = regen * m::SHIELD_REGEN_RATIO;
-                    if self.store.energy[i] >= cost {
-                        self.store.energy[i] -= cost;
-                        self.store.shield_hp[i] = std::cmp::min(self.store.shield_hp[i] + regen, max_hp);
+                // 采集
+                let elapsed = time.saturating_sub(store.last_collect_time[i]);
+                if elapsed > 0 && store.collector_durability[i] > 0 {
+                    let rate = player::collect_rate(store, idx);
+                    if rate > 0 {
+                        let ct = std::cmp::min(elapsed as u128, store.collector_durability[i] as u128);
+                        store.energy[i] += ct * rate;
+                        store.collector_durability[i] -= ct as u64;
                     }
                 }
-            }
+                store.last_collect_time[i] = time;
 
-            // 升级
-            let plan = player::plan_upgrades(&self.store, idx);
-            let max_up = if self.store.burnout[i] > 80 { 3 } else if self.store.burnout[i] > 50 { 8 } else if self.store.tilt_level[i] > 50 { 30 } else { 20 };
-            for _ in 0..max_up {
-                let mut ok = false;
-                for &sys in &plan {
-                    let (s, b) = player::try_upgrade(&mut self.store, idx, sys, is_ps);
-                    if s { self.total_dft_burned += b; ok = true; break; }
+                // Token
+                let interval = m::calc_token_regen_interval(store.weapon_lv[i] as u128);
+                let interval_s = (interval / 100) as u64;
+                if interval_s > 0 {
+                    let elapsed_t = time.saturating_sub(store.last_token_time[i]);
+                    if elapsed_t >= interval_s {
+                        let regened = (elapsed_t / interval_s) as u8;
+                        let max_t = m::calc_max_tokens(store.weapon_lv[i] as u128) as u8;
+                        store.attack_tokens[i] = std::cmp::min(store.attack_tokens[i] as u16 + regened as u16, max_t as u16) as u8;
+                        store.last_token_time[i] = time;
+                    }
                 }
-                if !ok { break; }
-            }
+
+                // 护盾再生
+                if store.shield_hp[i] > 0 {
+                    let max_hp = m::calc_shield_hp(store.shield_lv[i] as u128);
+                    if store.shield_hp[i] < max_hp {
+                        let regen = m::calc_shield_regen(store.shield_lv[i] as u128) * 12;
+                        let cost = regen * m::SHIELD_REGEN_RATIO;
+                        if store.energy[i] >= cost {
+                            store.energy[i] -= cost;
+                            store.shield_hp[i] = std::cmp::min(store.shield_hp[i] + regen, max_hp);
+                        }
+                    }
+                }
+
+                // 升级 (动态规划)
+                let plan = player::plan_upgrades(store, idx);
+                let max_up = if store.cold.burnout(idx) > 80 { 3 }
+                    else if store.cold.burnout(idx) > 50 { 8 }
+                    else if store.cold.tilt_level(idx) > 50 { 30 } else { 20 };
+                for _ in 0..max_up {
+                    let mut ok = false;
+                    for &sys in &plan {
+                        let (s, b) = player::try_upgrade(store, idx, sys, is_ps);
+                        if s { *burned_agg.lock().unwrap() += b; ok = true; break; }
+                    }
+                    if !ok { break; }
+                }
+            });
+
+            self.total_dft_burned += *burned_agg.lock().unwrap();
+            self.total_quits += *quits_agg.lock().unwrap();
         }
 
         // ═════ Phase C: 收集攻击订单 ═════
@@ -245,7 +261,7 @@ impl GameEngine {
         let grid_size = self.grid_size;
         let mut attack_orders: Vec<AttackOrder> = Vec::new();
 
-        for &idx in &active {
+        for &idx in &active_b {
             let i = idx as usize;
             if self.store.is_ruins[i] == 1 { continue; }
 
@@ -403,17 +419,17 @@ impl GameEngine {
         self.store.addresses[i] = addr;
         self.store.names[i] = name;
         self.store.personality_types[i] = preset.name;
-        self.store.aggression[i] = personality[0];
-        self.store.greed[i] = personality[1];
-        self.store.boldness[i] = personality[2];
-        self.store.sociability[i] = personality[3];
-        self.store.emotionality[i] = personality[4];
-        self.store.invites_remaining[i] = if inviter.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) };
-        self.store.invited_by[i] = inviter;
+        self.store.cold.set_aggression(idx, personality[0]);
+        self.store.cold.set_greed(idx, personality[1]);
+        self.store.cold.set_boldness(idx, personality[2]);
+        self.store.cold.set_sociability(idx, personality[3]);
+        self.store.cold.set_emotionality(idx, personality[4]);
+        self.store.cold.set_invites_remaining(idx, if inviter.is_some() { self.rng.gen_range(1..=3) } else { self.rng.gen_range(2..=4) });
+        self.store.cold.set_invited_by(idx, inviter);
         self.store.creation_time[i] = self.time.saturating_sub(86401);
         self.store.last_collect_time[i] = self.time;
         self.store.last_token_time[i] = self.time;
-        self.store.generation[i] = self.generation;
+        self.store.cold.set_generation(idx, self.generation);
         self.store.is_newbie_until[i] = self.time + m::NEWBIE_PROTECTION as u64;
 
         // 坐标
@@ -509,12 +525,12 @@ impl GameEngine {
         let mut inviters = Vec::new();
         for &idx in &active {
             let i = idx as usize;
-            if self.store.invites_remaining[i] == 0 { continue; }
+            if self.store.cold.invites_remaining(idx) == 0 { continue; }
             if self.store.is_newbie_until[i] > self.time { continue; }
 
-            let is_invited = self.store.invited_by[i].is_some();
+            let is_invited = self.store.cold.invited_by(idx).is_some();
             let base = if is_invited { 0.03 } else { 0.015 };
-            let s = self.store.sociability[i] as f64 / 100.0;
+            let s = self.store.cold.sociability(idx) as f64 / 100.0;
             let lv = self.store.total_level(idx) as f64 / 100.0;
             let prob = (base + s * if is_invited { 0.04 } else { 0.03 } + lv * if is_invited { 0.03 } else { 0.02 }) * density_factor;
 
@@ -525,9 +541,9 @@ impl GameEngine {
 
         for (inviter_idx, inviter_x) in inviters {
             let ii = inviter_idx as usize;
-            if self.store.invites_remaining[ii] == 0 { continue; }
-            self.store.invites_remaining[ii] -= 1;
-            self.store.referral_count[ii] += 1;
+            if self.store.cold.invites_remaining(inviter_idx) == 0 { continue; }
+            self.store.cold.set_invites_remaining(inviter_idx, self.store.cold.invites_remaining(inviter_idx) - 1);
+            self.store.cold.set_referral_count(inviter_idx, self.store.cold.referral_count(inviter_idx) + 1);
 
             // 奖励邀请者
             self.store.dft[ii] += m::REFERRAL_REWARD * 10u128.pow(18);
@@ -632,8 +648,8 @@ impl GameEngine {
             for &m in &a.members {
                 if m == a.leader { continue; }
                 if !self.store.is_active(m) { continue; }
-                let s = self.store.sociability[m as usize] as f64 / 100.0;
-                let e = self.store.emotionality[m as usize] as f64 / 100.0;
+                let s = self.store.cold.sociability(m) as f64 / 100.0;
+                let e = self.store.cold.emotionality(m) as f64 / 100.0;
                 let chance = (1.0 - coh) * 0.05 + (1.0 - s) * 0.01 + e * 0.01;
                 if self.rng.gen::<f64>() < chance { deserters.push((aid, m)); }
             }

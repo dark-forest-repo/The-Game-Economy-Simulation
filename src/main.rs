@@ -2,6 +2,7 @@
 mod math_engine;
 mod player;
 mod store;
+mod coldstore;
 mod engine;
 mod battle_engine;
 
@@ -68,9 +69,9 @@ fn run_milestone_scenario(config: SimConfig, label: &str) {
             let i = idx as usize;
             format!("Lv{} {} {} Gen{} atks={} kills={} reborn={}x{:.2} addr={}",
                 engine.store.total_level(idx) / 5, engine.store.personality_types[i],
-                engine.store.names[i], engine.store.generation[i],
+                engine.store.names[i], engine.store.cold.generation(idx),
                 engine.store.total_attacks[i], engine.store.total_victims[i],
-                engine.store.rebirth_count[i], engine.store.growth_multiplier[i],
+                engine.store.cold.rebirth_count(idx), engine.store.cold.growth_multiplier(idx),
                 engine.store.addresses[i])
         }
         None => "N/A".to_string(),
